@@ -93,8 +93,14 @@ public:
         struct burn_session *session = burn_session_create();
         burn_disc_add_session(disc, session, BURN_POS_END);
 
+        struct burn_source *src = burn_file_source_new(isoPath.c_str(), NULL);
+        if (!src) {
+            SetBurnLastError("Failed to create burn source from ISO");
+            burn_drive_release(drive, 0);
+            return false;
+        }
         struct burn_track *track = burn_track_create();
-        burn_track_set_source_iso(track, (char*)isoPath.c_str(), (off_t)0);
+        burn_track_set_source(track, src);
         burn_session_add_track(session, track, BURN_POS_END);
 
         struct burn_write_opts *opts = burn_write_opts_new(drive);
@@ -167,28 +173,45 @@ public:
             return false;
         }
 
-        IsoDataSource *src = nullptr;
-        iso_image_create_data_source(image, &src);
-        if (src) {
-            int64_t total = iso_image_get_size(image);
-            int64_t written = 0;
-            char buf[65536];
-            while (written < total) {
-                int64_t to_read = (total - written > (int64_t)sizeof(buf)) ? (int64_t)sizeof(buf) : (total - written);
-                (void)to_read;
-                int64_t r = src->read_block(src, (uint32_t)(written / 2048), buf);
-                if (r < 0) break;
-                fwrite(buf, 1, 2048, f);
-                written += 2048;
-                int pct = total > 0 ? (int)(written * 100 / total) : 100;
-                if (pct > 50 && pct < 100) {
-                    char msg[64];
-                    snprintf(msg, sizeof(msg), "Writing... %d%%", pct);
-                    NotifyProgressBurn(pct, msg);
-                }
-            }
-            src->free_data(src);
+        // Use libisofs dump to file via iso_image_create_burn_source + iso_burn
+        // Simplified: write using iso_image_dump (if available) or fallback
+        // For portability, use iso_write (libisoburn) approach
+        IsoWriteOpts *wopts = nullptr;
+        iso_write_opts_new(&wopts, 0);
+        iso_write_opts_set_iso_level(wopts, 3);
+        iso_write_opts_set_rockridge(wopts, 1);
+        iso_write_opts_set_joliet(wopts, 1);
+
+        // Dump image to file using libisofs iso_image_create_burn_source
+        IsoBurnSource *burn_src = nullptr;
+        ret = iso_image_create_burn_source(image, wopts, &burn_src);
+        if (ret < 0) {
+            SetBurnLastError("Failed to create burn source");
+            iso_write_opts_free(wopts);
+            iso_image_unref(image);
+            fclose(f);
+            return false;
         }
+
+        char buf[65536];
+        int64_t total = burn_src->size;
+        int64_t written = 0;
+        while (written < total) {
+            size_t to_read = (total - written > (int64_t)sizeof(buf)) ? sizeof(buf) : (size_t)(total - written);
+            size_t r = burn_src->read(burn_src, buf, to_read);
+            if (r <= 0) break;
+            fwrite(buf, 1, r, f);
+            written += r;
+            int pct = total > 0 ? (int)(written * 100 / total) : 100;
+            if (pct > 50 && pct < 100) {
+                char msg[64];
+                snprintf(msg, sizeof(msg), "Writing... %d%%", pct);
+                NotifyProgressBurn(pct, msg);
+            }
+        }
+
+        burn_src->free(burn_src);
+        iso_write_opts_free(wopts);
 
         fclose(f);
         iso_write_opts_free(opts);
