@@ -17,8 +17,9 @@
 #pragma comment(lib, "ole32.lib")
 #pragma comment(lib, "oleaut32.lib")
 
-extern "C" void SetBurnLastError(const std::string& error);
-extern "C" void NotifyProgressBurn(int percent, const char* status);
+/* Internal C++ helpers — NOT extern "C" (they take std::string) */
+void SetBurnLastError(const std::string& error);
+void NotifyProgressBurn(int percent, const char* status);
 
 class WindowsPlatform : public IPlatform {
 public:

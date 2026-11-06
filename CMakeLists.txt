@@ -58,7 +58,7 @@ target_include_directories(${PROJECT_NAME} PUBLIC
 
 if(MSVC)
     target_compile_definitions(${PROJECT_NAME} PRIVATE BUILDING_DLL _CRT_SECURE_NO_WARNINGS)
-    target_link_libraries(${PROJECT_NAME} PRIVATE wbemuuid ole32 oleaut32 shlwapi comsuppw)
+    target_link_libraries(${PROJECT_NAME} PRIVATE wbemuuid ole32 oleaut32 shlwapi)
     # IMAPI2 is part of Windows SDK, no extra lib needed
 elseif(UNIX AND NOT APPLE)
     target_compile_definitions(${PROJECT_NAME} PRIVATE __linux__)

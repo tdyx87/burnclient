@@ -1,7 +1,6 @@
 #include "burning_utility.h"
 #include <string>
 #include <vector>
-#include <map>
 #include <memory>
 #include <cstring>
 #include <cstdlib>
@@ -25,24 +24,6 @@ static thread_local int g_defaultSpeed = 4;
 static thread_local BurnProgressCallback g_progressCallback = nullptr;
 static thread_local void* g_progressUserData = nullptr;
 
-/* ---------------------------------------------------------------------------
- * Cached platform instance — avoids repeated CoInitializeEx/CoUninitialize
- * on Windows and burn_initialize/burn_finish on Linux.
- * ------------------------------------------------------------------------- */
-static IPlatform& GetPlatformInstance() {
-    static thread_local std::unique_ptr<IPlatform> s_instance;
-    if (!s_instance) {
-        s_instance = CreatePlatformImpl();
-    }
-    if (!s_instance) {
-        /* Fallback should never happen, but be safe */
-        static IPlatform* s_null = nullptr;
-        /* Return a reference to a dummy — callers check null separately.
-           In practice CreatePlatformImpl always returns a valid object. */
-    }
-    return *s_instance;
-}
-
 /* Helper to get a platform instance (may return null) */
 static std::unique_ptr<IPlatform>& GetPlatformRef() {
     static thread_local std::unique_ptr<IPlatform> s_instance;
@@ -52,31 +33,10 @@ static std::unique_ptr<IPlatform>& GetPlatformRef() {
     return s_instance;
 }
 
-extern "C" {
-
+/* Internal helpers — NOT extern "C" because they take std::string.
+ * Declared as regular C++ functions with internal linkage. */
 void SetBurnLastError(const std::string& error) {
     g_lastError = error;
-}
-
-const char* GetLastErrorMessage() {
-    static thread_local std::string result;
-    result = g_lastError;
-    return result.c_str();
-}
-
-void ClearLastError() {
-    g_lastError.clear();
-}
-
-void FreeStringMemory(void* ptr) {
-    if (ptr) {
-        free(ptr);
-    }
-}
-
-void SetProgressCallback(BurnProgressCallback callback, void* userData) {
-    g_progressCallback = callback;
-    g_progressUserData = userData;
 }
 
 void NotifyProgressBurn(int percent, const char* status) {
@@ -86,8 +46,12 @@ void NotifyProgressBurn(int percent, const char* status) {
 }
 
 /* ---------------------------------------------------------------------------
- * Cross-platform temporary file path generation
+ * C API — these functions are declared extern "C" in the header and must
+ * have C linkage here. SetBurnLastError and NotifyProgressBurn are internal
+ * C++ helpers and are NOT inside the extern "C" block.
  * ------------------------------------------------------------------------- */
+
+/* Cross-platform temporary file path generation */
 static std::string GenerateTempISOPath() {
     std::random_device rd;
     std::uniform_int_distribution<int> dist(100000, 999999);
@@ -112,9 +76,7 @@ static std::string GenerateTempISOPath() {
 #endif
 }
 
-/* ---------------------------------------------------------------------------
- * Cross-platform path / file existence check
- * ------------------------------------------------------------------------- */
+/* Cross-platform path / file existence check */
 static bool PathExists(const char* path) {
     if (!path) return false;
 #if defined(_WIN32)
@@ -124,6 +86,29 @@ static bool PathExists(const char* path) {
     struct stat st;
     return stat(path, &st) == 0;
 #endif
+}
+
+extern "C" {
+
+const char* GetLastErrorMessage() {
+    static thread_local std::string result;
+    result = g_lastError;
+    return result.c_str();
+}
+
+void ClearLastError() {
+    g_lastError.clear();
+}
+
+void FreeStringMemory(void* ptr) {
+    if (ptr) {
+        free(ptr);
+    }
+}
+
+void SetProgressCallback(BurnProgressCallback callback, void* userData) {
+    g_progressCallback = callback;
+    g_progressUserData = userData;
 }
 
 int CreateISOToDisc(const char* isoPath, const char* devicePath, const char* discType, int speed) {
