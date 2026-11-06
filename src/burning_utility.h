@@ -62,6 +62,12 @@ extern "C" {
 #define BURN_ERROR_TOOL_NOT_AVAILABLE -6
 #define BURN_ERROR_PERMISSION_DENIED -7
 #define BURN_ERROR_UNSUPPORTED_FORMAT -8
+/* Reserved for the handle-based job API (Burn_Start / GetStatus / Cancel /
+ * Wait) and for the exception boundary around every exported C function. */
+#define BURN_ERROR_EXCEPTION -9
+#define BURN_ERROR_CANCELLED -10
+#define BURN_ERROR_TIMEOUT -11
+#define BURN_ERROR_BUSY -12
 
 typedef void (*BurnProgressCallback)(int percent, const char* status, void* userData);
 

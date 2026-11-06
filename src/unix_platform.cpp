@@ -237,33 +237,45 @@ public:
             return false;
         }
 
-        /* burn_disc_write returns void — it starts the async write.
-         * Poll burn_drive_get_status until the drive goes IDLE.
-         * The drive may pass through WRITING, WRITING_LEADIN,
-         * WRITING_LEADOUT, WRITING_PREGAP, CLOSING_TRACK, CLOSING_SESSION. */
+        /* burn_write_opts_auto_write_type() chooses AND applies the write
+         * type; upstream requires it immediately before burn_disc_write().
+         * This call was missing entirely — the old code polled a drive that
+         * was never told to write, so Linux burns were a silent no-op. */
+        burn_disc_write(opts, disc);
+
+        /* burn_disc_write() returns void and starts the asynchronous write.
+         * Poll burn_drive_get_status() until the drive goes IDLE. It passes
+         * through SPAWNING, WRITING*, CLOSING_TRACK and CLOSING_SESSION;
+         * any non-IDLE status keeps the loop alive (including SPAWNING,
+         * which covers the startup race before the writer thread begins). */
         struct burn_progress progress;
         enum burn_drive_status drive_status;
         while ((drive_status = burn_drive_get_status(drive, &progress)) != BURN_DRIVE_IDLE) {
             if (drive_status == BURN_DRIVE_WRITING ||
                 drive_status == BURN_DRIVE_WRITING_LEADIN ||
-                drive_status == BURN_DRIVE_WRITING_LEADOUT) {
-                /* struct burn_progress uses .sectors (total) and .sector (current) */
+                drive_status == BURN_DRIVE_WRITING_LEADOUT ||
+                drive_status == BURN_DRIVE_WRITING_PREGAP ||
+                drive_status == BURN_DRIVE_CLOSING_TRACK ||
+                drive_status == BURN_DRIVE_CLOSING_SESSION) {
+                /* struct burn_progress uses .sectors (total) and .sector
+                 * (current). Report the real 0..99% instead of faking 50%. */
                 int percent = progress.sectors > 0
                     ? (int)(progress.sector * 100.0 / progress.sectors)
-                    : 50;
-                if (percent > 50 && percent < 100) {
-                    char buf[128];
-                    snprintf(buf, sizeof(buf), "Burning... %d%%", percent);
-                    NotifyProgressBurn(percent, buf);
-                }
+                    : 0;
+                if (percent < 0) percent = 0;
+                if (percent > 99) percent = 99;
+                char buf[128];
+                snprintf(buf, sizeof(buf), "Burning... %d%%", percent);
+                NotifyProgressBurn(percent, buf);
             }
-            usleep(500000);
+            usleep(100000);
         }
 
-        /* After the drive goes IDLE, check if the burn succeeded by
-         * looking at the disc status — if it's FULL, the burn worked. */
-        enum burn_disc_status post_status = burn_disc_get_status(drive);
-        bool burn_ok = (post_status == BURN_DISC_FULL || post_status == BURN_DISC_APPENDABLE);
+        /* burn_drive_wrote_well() is the authoritative result of the most
+         * recent asynchronous burn_disc_write() (1 = ok, 0 = failed). The
+         * previous burn_disc_get_status() heuristic was unreliable because
+         * the drive may still report the pre-write media state here. */
+        bool burn_ok = (burn_drive_wrote_well(drive) > 0);
 
         burn_write_opts_free(opts);
         burn_track_free(track);

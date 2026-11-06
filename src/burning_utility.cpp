@@ -7,6 +7,7 @@
 #include <cstdio>
 #include <random>
 #include <system_error>
+#include <exception>
 
 #if defined(_WIN32)
 #include <windows.h>
@@ -42,7 +43,13 @@ void SetBurnLastError(const std::string& error) {
 
 void NotifyProgressBurn(int percent, const char* status) {
     if (g_progressCallback) {
-        g_progressCallback(percent, status, g_progressUserData);
+        /* The callback belongs to the caller. An exception thrown out of it
+         * must never unwind through platform/COM/libburn C frames or through
+         * an exported C function. Swallow it and keep the burn running. */
+        try {
+            g_progressCallback(percent, status, g_progressUserData);
+        } catch (...) {
+        }
     }
 }
 
@@ -92,252 +99,396 @@ static bool PathExists(const char* path) {
 extern "C" {
 
 const char* GetLastErrorMessage() {
-    static thread_local std::string result;
-    result = g_lastError;
-    return result.c_str();
+    try {
+        static thread_local std::string result;
+        result = g_lastError;
+        return result.c_str();
+    } catch (const std::exception& e) {
+        SetBurnLastError(std::string("Internal exception: ") + e.what());
+        return "Internal exception";
+    } catch (...) {
+        SetBurnLastError("Internal exception (unknown type)");
+        return "Internal exception";
+    }
 }
 
 void ClearLastError() {
-    g_lastError.clear();
+    try {
+        g_lastError.clear();
+    } catch (const std::exception& e) {
+        SetBurnLastError(std::string("Internal exception: ") + e.what());
+        return;
+    } catch (...) {
+        SetBurnLastError("Internal exception (unknown type)");
+        return;
+    }
 }
 
 void FreeStringMemory(void* ptr) {
-    if (ptr) {
-        free(ptr);
+    try {
+        if (ptr) {
+            free(ptr);
+        }
+    } catch (const std::exception& e) {
+        SetBurnLastError(std::string("Internal exception: ") + e.what());
+        return;
+    } catch (...) {
+        SetBurnLastError("Internal exception (unknown type)");
+        return;
     }
 }
 
 void SetProgressCallback(BurnProgressCallback callback, void* userData) {
-    g_progressCallback = callback;
-    g_progressUserData = userData;
+    try {
+        g_progressCallback = callback;
+        g_progressUserData = userData;
+    } catch (const std::exception& e) {
+        SetBurnLastError(std::string("Internal exception: ") + e.what());
+        return;
+    } catch (...) {
+        SetBurnLastError("Internal exception (unknown type)");
+        return;
+    }
 }
 
 int CreateISOToDisc(const char* isoPath, const char* devicePath, const char* discType, int speed) {
-    if (!isoPath || !devicePath) {
-        SetBurnLastError("Invalid parameters");
-        return BURN_ERROR_INVALID_PARAM;
+    try {
+        if (!isoPath || !devicePath) {
+            SetBurnLastError("Invalid parameters");
+            return BURN_ERROR_INVALID_PARAM;
+        }
+
+        if (!PathExists(isoPath)) {
+            SetBurnLastError("ISO file not found");
+            return BURN_ERROR_INVALID_PARAM;
+        }
+
+        IPlatform* platform = GetPlatform();
+        if (!platform) {
+            SetBurnLastError("Failed to create platform implementation");
+            return BURN_ERROR_UNSUPPORTED_FORMAT;
+        }
+
+        std::string disc = discType ? discType : g_defaultDiscType;
+        int burnSpeed = speed > 0 ? speed : g_defaultSpeed;
+
+        if (platform->BurnISO(isoPath, devicePath, disc, burnSpeed)) {
+            return BURN_SUCCESS;
+        }
+
+        return BURN_ERROR_BURN_FAILED;
+    } catch (const std::exception& e) {
+        SetBurnLastError(std::string("Internal exception: ") + e.what());
+        return BURN_ERROR_EXCEPTION;
+    } catch (...) {
+        SetBurnLastError("Internal exception (unknown type)");
+        return BURN_ERROR_EXCEPTION;
     }
-
-    if (!PathExists(isoPath)) {
-        SetBurnLastError("ISO file not found");
-        return BURN_ERROR_INVALID_PARAM;
-    }
-
-    IPlatform* platform = GetPlatform();
-    if (!platform) {
-        SetBurnLastError("Failed to create platform implementation");
-        return BURN_ERROR_UNSUPPORTED_FORMAT;
-    }
-
-    std::string disc = discType ? discType : g_defaultDiscType;
-    int burnSpeed = speed > 0 ? speed : g_defaultSpeed;
-
-    if (platform->BurnISO(isoPath, devicePath, disc, burnSpeed)) {
-        return BURN_SUCCESS;
-    }
-
-    return BURN_ERROR_BURN_FAILED;
 }
 
 int BurnDirectoryToDisc(const char* sourceDir, const char* devicePath, const char* discType, int speed) {
-    if (!sourceDir || !devicePath) {
-        SetBurnLastError("Invalid parameters");
-        return BURN_ERROR_INVALID_PARAM;
-    }
+    try {
+        if (!sourceDir || !devicePath) {
+            SetBurnLastError("Invalid parameters");
+            return BURN_ERROR_INVALID_PARAM;
+        }
 
-    if (!PathExists(sourceDir)) {
-        SetBurnLastError("Source directory not found");
-        return BURN_ERROR_INVALID_PARAM;
-    }
+        if (!PathExists(sourceDir)) {
+            SetBurnLastError("Source directory not found");
+            return BURN_ERROR_INVALID_PARAM;
+        }
 
-    std::string tempIsoPath = GenerateTempISOPath();
+        std::string tempIsoPath = GenerateTempISOPath();
 
-    if (CreateISOImage(sourceDir, tempIsoPath.c_str(), "BURN") != BURN_SUCCESS) {
-        SetBurnLastError("Failed to create temporary ISO");
-        /* Clean up partial file */
+        if (CreateISOImage(sourceDir, tempIsoPath.c_str(), "BURN") != BURN_SUCCESS) {
+            SetBurnLastError("Failed to create temporary ISO");
+            /* Clean up partial file */
+            remove(tempIsoPath.c_str());
+            return BURN_ERROR_ISO_CREATION_FAILED;
+        }
+
+        int result = CreateISOToDisc(tempIsoPath.c_str(), devicePath, discType, speed);
+
         remove(tempIsoPath.c_str());
-        return BURN_ERROR_ISO_CREATION_FAILED;
+
+        return result;
+    } catch (const std::exception& e) {
+        SetBurnLastError(std::string("Internal exception: ") + e.what());
+        return BURN_ERROR_EXCEPTION;
+    } catch (...) {
+        SetBurnLastError("Internal exception (unknown type)");
+        return BURN_ERROR_EXCEPTION;
     }
-
-    int result = CreateISOToDisc(tempIsoPath.c_str(), devicePath, discType, speed);
-
-    remove(tempIsoPath.c_str());
-
-    return result;
 }
 
 int CreateISOImage(const char* sourcePath, const char* isoPath, const char* volumeLabel) {
-    if (!sourcePath || !isoPath) {
-        SetBurnLastError("Invalid parameters");
-        return BURN_ERROR_INVALID_PARAM;
+    try {
+        if (!sourcePath || !isoPath) {
+            SetBurnLastError("Invalid parameters");
+            return BURN_ERROR_INVALID_PARAM;
+        }
+
+        if (!PathExists(sourcePath)) {
+            SetBurnLastError("Source path not found");
+            return BURN_ERROR_INVALID_PARAM;
+        }
+
+        IPlatform* platform = GetPlatform();
+        if (!platform) {
+            SetBurnLastError("Failed to create platform implementation");
+            return BURN_ERROR_UNSUPPORTED_FORMAT;
+        }
+
+        std::string label = volumeLabel ? volumeLabel : "DISC";
+
+        if (platform->CreateISO(sourcePath, isoPath, label)) {
+            return BURN_SUCCESS;
+        }
+
+        return BURN_ERROR_ISO_CREATION_FAILED;
+    } catch (const std::exception& e) {
+        SetBurnLastError(std::string("Internal exception: ") + e.what());
+        return BURN_ERROR_EXCEPTION;
+    } catch (...) {
+        SetBurnLastError("Internal exception (unknown type)");
+        return BURN_ERROR_EXCEPTION;
     }
-
-    if (!PathExists(sourcePath)) {
-        SetBurnLastError("Source path not found");
-        return BURN_ERROR_INVALID_PARAM;
-    }
-
-    IPlatform* platform = GetPlatform();
-    if (!platform) {
-        SetBurnLastError("Failed to create platform implementation");
-        return BURN_ERROR_UNSUPPORTED_FORMAT;
-    }
-
-    std::string label = volumeLabel ? volumeLabel : "DISC";
-
-    if (platform->CreateISO(sourcePath, isoPath, label)) {
-        return BURN_SUCCESS;
-    }
-
-    return BURN_ERROR_ISO_CREATION_FAILED;
 }
 
 int VerifyDisc(const char* devicePath, const char* isoPath) {
-    if (!devicePath || !isoPath) {
-        SetBurnLastError("Invalid parameters");
-        return BURN_ERROR_INVALID_PARAM;
+    try {
+        if (!devicePath || !isoPath) {
+            SetBurnLastError("Invalid parameters");
+            return BURN_ERROR_INVALID_PARAM;
+        }
+
+        /* Check that the ISO file exists */
+        if (!PathExists(isoPath)) {
+            SetBurnLastError("ISO file not found for verification");
+            return BURN_ERROR_INVALID_PARAM;
+        }
+
+        /* Get ISO file size */
+        FILE* isoFile = fopen(isoPath, "rb");
+        if (!isoFile) {
+            SetBurnLastError("Cannot open ISO file for verification");
+            return BURN_ERROR_INVALID_PARAM;
+        }
+        fseek(isoFile, 0, SEEK_END);
+        long isoSize = ftell(isoFile);
+        fclose(isoFile);
+
+        if (isoSize <= 0) {
+            SetBurnLastError("ISO file is empty");
+            return BURN_ERROR_ISO_CREATION_FAILED;
+        }
+
+        /* On Windows, we could use IMAPI2 to read back the disc and compare.
+         * On Linux, we could use libburn to read the disc back.
+         * For now, perform a basic size-based sanity check via the platform. */
+        NotifyProgressBurn(50, "Verifying disc...");
+        NotifyProgressBurn(100, "Verification completed (basic check)");
+
+        /* TODO: Full byte-level verification by reading disc sectors back and
+         * comparing with the ISO file. This requires platform-specific
+         * read-from-disc support which is not yet implemented. */
+
+        return BURN_SUCCESS;
+    } catch (const std::exception& e) {
+        SetBurnLastError(std::string("Internal exception: ") + e.what());
+        return BURN_ERROR_EXCEPTION;
+    } catch (...) {
+        SetBurnLastError("Internal exception (unknown type)");
+        return BURN_ERROR_EXCEPTION;
     }
-
-    /* Check that the ISO file exists */
-    if (!PathExists(isoPath)) {
-        SetBurnLastError("ISO file not found for verification");
-        return BURN_ERROR_INVALID_PARAM;
-    }
-
-    /* Get ISO file size */
-    FILE* isoFile = fopen(isoPath, "rb");
-    if (!isoFile) {
-        SetBurnLastError("Cannot open ISO file for verification");
-        return BURN_ERROR_INVALID_PARAM;
-    }
-    fseek(isoFile, 0, SEEK_END);
-    long isoSize = ftell(isoFile);
-    fclose(isoFile);
-
-    if (isoSize <= 0) {
-        SetBurnLastError("ISO file is empty");
-        return BURN_ERROR_ISO_CREATION_FAILED;
-    }
-
-    /* On Windows, we could use IMAPI2 to read back the disc and compare.
-     * On Linux, we could use libburn to read the disc back.
-     * For now, perform a basic size-based sanity check via the platform. */
-    NotifyProgressBurn(50, "Verifying disc...");
-    NotifyProgressBurn(100, "Verification completed (basic check)");
-
-    /* TODO: Full byte-level verification by reading disc sectors back and
-     * comparing with the ISO file. This requires platform-specific
-     * read-from-disc support which is not yet implemented. */
-
-    return BURN_SUCCESS;
 }
 
 int ListBurningDevices(DeviceInfo** devices, int* deviceCount) {
-    if (!devices || !deviceCount) {
-        SetBurnLastError("Invalid parameters");
-        return BURN_ERROR_INVALID_PARAM;
-    }
+    try {
+        if (!devices || !deviceCount) {
+            SetBurnLastError("Invalid parameters");
+            return BURN_ERROR_INVALID_PARAM;
+        }
 
-    IPlatform* platform = GetPlatform();
-    if (!platform) {
-        SetBurnLastError("Failed to create platform implementation");
-        return BURN_ERROR_UNSUPPORTED_FORMAT;
-    }
+        IPlatform* platform = GetPlatform();
+        if (!platform) {
+            SetBurnLastError("Failed to create platform implementation");
+            return BURN_ERROR_UNSUPPORTED_FORMAT;
+        }
 
-    std::vector<DeviceInfo> deviceList = platform->ListDevices();
-    *deviceCount = (int)deviceList.size();
+        std::vector<DeviceInfo> deviceList = platform->ListDevices();
+        *deviceCount = (int)deviceList.size();
 
-    if (*deviceCount == 0) {
-        *devices = nullptr;
+        if (*deviceCount == 0) {
+            *devices = nullptr;
+            return BURN_SUCCESS;
+        }
+
+        *devices = (DeviceInfo*)malloc(sizeof(DeviceInfo) * (*deviceCount));
+        if (!*devices) {
+            SetBurnLastError("Memory allocation failed");
+            return BURN_ERROR_NO_SPACE;
+        }
+        for (int i = 0; i < *deviceCount; ++i) {
+            (*devices)[i] = deviceList[i];
+        }
+
         return BURN_SUCCESS;
+    } catch (const std::exception& e) {
+        SetBurnLastError(std::string("Internal exception: ") + e.what());
+        return BURN_ERROR_EXCEPTION;
+    } catch (...) {
+        SetBurnLastError("Internal exception (unknown type)");
+        return BURN_ERROR_EXCEPTION;
     }
-
-    *devices = (DeviceInfo*)malloc(sizeof(DeviceInfo) * (*deviceCount));
-    if (!*devices) {
-        SetBurnLastError("Memory allocation failed");
-        return BURN_ERROR_NO_SPACE;
-    }
-    for (int i = 0; i < *deviceCount; ++i) {
-        (*devices)[i] = deviceList[i];
-    }
-
-    return BURN_SUCCESS;
 }
 
 void FreeDeviceList(DeviceInfo* devices, int deviceCount) {
-    if (devices) {
-        free(devices);
+    try {
+        if (devices) {
+            free(devices);
+        }
+    } catch (const std::exception& e) {
+        SetBurnLastError(std::string("Internal exception: ") + e.what());
+        return;
+    } catch (...) {
+        SetBurnLastError("Internal exception (unknown type)");
+        return;
     }
 }
 
 int GetDefaultDevice(char* devicePath, int bufferSize) {
-    if (!devicePath || bufferSize <= 0) {
-        return BURN_ERROR_INVALID_PARAM;
-    }
+    try {
+        if (!devicePath || bufferSize <= 0) {
+            return BURN_ERROR_INVALID_PARAM;
+        }
 
-    if (g_defaultDevice.empty()) {
-        devicePath[0] = '\0';
-        return BURN_ERROR_DEVICE_NOT_FOUND;
-    }
+        if (g_defaultDevice.empty()) {
+            devicePath[0] = '\0';
+            return BURN_ERROR_DEVICE_NOT_FOUND;
+        }
 
-    strncpy(devicePath, g_defaultDevice.c_str(), bufferSize - 1);
-    devicePath[bufferSize - 1] = '\0';
-    return BURN_SUCCESS;
+        strncpy(devicePath, g_defaultDevice.c_str(), bufferSize - 1);
+        devicePath[bufferSize - 1] = '\0';
+        return BURN_SUCCESS;
+    } catch (const std::exception& e) {
+        SetBurnLastError(std::string("Internal exception: ") + e.what());
+        return BURN_ERROR_EXCEPTION;
+    } catch (...) {
+        SetBurnLastError("Internal exception (unknown type)");
+        return BURN_ERROR_EXCEPTION;
+    }
 }
 
 const char* GetPlatformInfo() {
-    IPlatform* platform = GetPlatform();
-    if (!platform) {
-        return "Unknown";
-    }
+    try {
+        IPlatform* platform = GetPlatform();
+        if (!platform) {
+            return "Unknown";
+        }
 
-    static thread_local std::string result;
-    result = platform->GetPlatformInfo();
-    return result.c_str();
+        static thread_local std::string result;
+        result = platform->GetPlatformInfo();
+        return result.c_str();
+    } catch (const std::exception& e) {
+        SetBurnLastError(std::string("Internal exception: ") + e.what());
+        return "Internal exception";
+    } catch (...) {
+        SetBurnLastError("Internal exception (unknown type)");
+        return "Internal exception";
+    }
 }
 
 int CheckToolAvailability(const char* toolName) {
-    if (!toolName) {
-        return 0;
-    }
+    try {
+        if (!toolName) {
+            return 0;
+        }
 
-    IPlatform* platform = GetPlatform();
-    if (!platform) {
-        return 0;
-    }
+        IPlatform* platform = GetPlatform();
+        if (!platform) {
+            return 0;
+        }
 
-    return platform->CheckToolAvailability(toolName) ? 1 : 0;
+        return platform->CheckToolAvailability(toolName) ? 1 : 0;
+    } catch (const std::exception& e) {
+        SetBurnLastError(std::string("Internal exception: ") + e.what());
+        return BURN_ERROR_EXCEPTION;
+    } catch (...) {
+        SetBurnLastError("Internal exception (unknown type)");
+        return BURN_ERROR_EXCEPTION;
+    }
 }
 
 const char* GetSupportedFormats() {
-    static const char* formats = "CD-R, CD-RW, DVD-R, DVD+R, DVD-RW, DVD+RW, DVD-RAM, BD-R, BD-RE";
-    /* This is a string literal — callers must NOT call FreeStringMemory on it. */
-    return formats;
+    try {
+        static const char* formats = "CD-R, CD-RW, DVD-R, DVD+R, DVD-RW, DVD+RW, DVD-RAM, BD-R, BD-RE";
+        /* This is a string literal — callers must NOT call FreeStringMemory on it. */
+        return formats;
+    } catch (const std::exception& e) {
+        SetBurnLastError(std::string("Internal exception: ") + e.what());
+        return "Internal exception";
+    } catch (...) {
+        SetBurnLastError("Internal exception (unknown type)");
+        return "Internal exception";
+    }
 }
 
 int ValidateSourcePath(const char* path) {
-    if (!path) {
-        return 0;
+    try {
+        if (!path) {
+            return 0;
+        }
+        /* Use cross-platform path existence check */
+        return PathExists(path) ? 1 : 0;
+    } catch (const std::exception& e) {
+        SetBurnLastError(std::string("Internal exception: ") + e.what());
+        return BURN_ERROR_EXCEPTION;
+    } catch (...) {
+        SetBurnLastError("Internal exception (unknown type)");
+        return BURN_ERROR_EXCEPTION;
     }
-    /* Use cross-platform path existence check */
-    return PathExists(path) ? 1 : 0;
 }
 
 void SetDefaultDevice(const char* device) {
-    if (device) {
-        g_defaultDevice = device;
+    try {
+        if (device) {
+            g_defaultDevice = device;
+        }
+    } catch (const std::exception& e) {
+        SetBurnLastError(std::string("Internal exception: ") + e.what());
+        return;
+    } catch (...) {
+        SetBurnLastError("Internal exception (unknown type)");
+        return;
     }
 }
 
 void SetDefaultDiscType(const char* discType) {
-    if (discType) {
-        g_defaultDiscType = discType;
+    try {
+        if (discType) {
+            g_defaultDiscType = discType;
+        }
+    } catch (const std::exception& e) {
+        SetBurnLastError(std::string("Internal exception: ") + e.what());
+        return;
+    } catch (...) {
+        SetBurnLastError("Internal exception (unknown type)");
+        return;
     }
 }
 
 void SetDefaultSpeed(int speed) {
-    if (speed > 0) {
-        g_defaultSpeed = speed;
+    try {
+        if (speed > 0) {
+            g_defaultSpeed = speed;
+        }
+    } catch (const std::exception& e) {
+        SetBurnLastError(std::string("Internal exception: ") + e.what());
+        return;
+    } catch (...) {
+        SetBurnLastError("Internal exception (unknown type)");
+        return;
     }
 }
 
