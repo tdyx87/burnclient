@@ -4,7 +4,7 @@ add_executable(test_burning_utility
     test_burning_utility.cpp
 )
 
-target_link_libraries(test_burning_utility PRIVATE BurningDLL)
+target_link_libraries(test_burning_utility PRIVATE BurningDLL Threads::Threads)
 
 target_include_directories(test_burning_utility PRIVATE
     ${CMAKE_SOURCE_DIR}/src

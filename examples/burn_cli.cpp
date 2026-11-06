@@ -3,6 +3,8 @@
 #include <vector>
 #include <string>
 #include <cstring>
+#include <chrono>
+#include <thread>
 
 static void progressCallback(int percent, const char* status, void* userData) {
     std::cout << "\rProgress: " << percent << "% - " << status << std::flush;
@@ -18,7 +20,65 @@ static void printUsage() {
               << "  create-iso <src> <iso> [label]   Create ISO from directory\n"
               << "  burn-iso <iso> <device> [type] [speed]  Burn ISO to device\n"
               << "  burn-dir <src> <device> [type] [speed] Burn directory to device\n"
-              << "  verify <device> <iso>     Verify disc\n";
+              << "  verify <device> <iso>     Verify disc\n"
+              << "  burn-job <iso> <device> [type] [speed]  Async burn with live status\n"
+              << "  job-selftest [cancel]     Diagnostic job, optionally cancelled\n";
+}
+
+/* Start a job and poll its state machine. This is the pattern applications
+ * should use: Start -> GetStatus loop -> (optional Cancel) -> Wait -> Release. */
+static int runJob(const BurnJobOptions& options, bool cancelAt20) {
+    BurnJobHandle handle = Burn_Start(&options);
+    if (handle == BURN_INVALID_JOB_HANDLE) {
+        std::cout << "Burn_Start failed: " << GetLastErrorMessage() << "\n";
+        return 1;
+    }
+
+    bool cancelled = false;
+    for (;;) {
+        BurnJobStatus status;
+        std::memset(&status, 0, sizeof(status));
+        status.size = (int)sizeof(status);
+        if (Burn_GetStatus(handle, &status) != BURN_SUCCESS) {
+            std::cout << "Burn_GetStatus failed\n";
+            break;
+        }
+        std::cout << "state=" << status.state << " " << status.percent
+                  << "% phase=" << status.phase << " " << status.message << "\n";
+        if (status.state != BURN_JOB_PENDING && status.state != BURN_JOB_RUNNING) break;
+        if (cancelAt20 && !cancelled && status.percent >= 20) {
+            std::cout << "Cancelling...\n";
+            Burn_Cancel(handle);
+            cancelled = true;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(200));
+    }
+
+    if (Burn_Wait(handle, 10000) != BURN_SUCCESS) {
+        std::cout << "Timed out waiting for the job\n";
+    }
+    BurnJobStatus final;
+    std::memset(&final, 0, sizeof(final));
+    final.size = (int)sizeof(final);
+    int result = 1;
+    if (Burn_GetStatus(handle, &final) == BURN_SUCCESS) {
+        std::cout << "final: state=" << final.state << " code=" << final.errorCode
+                  << " elapsed=" << final.elapsedMs << "ms\n";
+        if (final.errorMessage[0]) {
+            std::cout << "error: " << final.errorMessage << "\n";
+        }
+        result = final.state == BURN_JOB_COMPLETED ? 0 : 1;
+    }
+    Burn_Release(handle);
+    return result;
+}
+
+static BurnJobOptions makeOptions(int mode) {
+    BurnJobOptions options;
+    std::memset(&options, 0, sizeof(options));
+    options.size = (int)sizeof(options);
+    options.mode = mode;
+    return options;
 }
 
 int main(int argc, char* argv[]) {
@@ -71,6 +131,19 @@ int main(int argc, char* argv[]) {
         std::cout << (ok ? "OK" : "FAILED: " + util.GetLastErrorMessage()) << "\n";
         return ok ? 0 : 1;
     }
+    if (cmd == "burn-job" && argc >= 4) {
+        BurnJobOptions options = makeOptions(BURN_JOB_MODE_IMAGE);
+        options.sourcePath = argv[2];
+        options.devicePath = argv[3];
+        options.discType = (argc >= 5) ? argv[4] : "CD-R";
+        options.speed = (argc >= 6) ? std::stoi(argv[5]) : 4;
+        return runJob(options, false);
+    }
+    if (cmd == "job-selftest") {
+        BurnJobOptions options = makeOptions(BURN_JOB_MODE_SELFTEST);
+        return runJob(options, argc >= 3 && std::string(argv[2]) == "cancel");
+    }
+
     printUsage();
     return 1;
 }

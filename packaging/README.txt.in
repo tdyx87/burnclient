@@ -1,21 +1,57 @@
-BurningDLL @PROJECT_VERSION@
+BurningDLL @PROJECT_VERSION@   (C API version 2)
 Built for: @CMAKE_SYSTEM_NAME@ / @CMAKE_CXX_COMPILER_ID@ / @CMAKE_BUILD_TYPE@
 
-Cross-platform disc-burning utility (C API + BurningUtility C++ wrapper).
+Cross-platform disc-burning utility: synchronous C API, C++ wrappers, and an
+asynchronous handle-based job API with live status, cancellation and full
+exception containment at the DLL boundary.
 
 Contents
 --------
   bin/       burning_dll.dll | libburning_dll.so* | libburning_dll*.dylib
              burn_cli              command-line example, needs the shared lib
   lib/       burning_dll.lib       Windows import library only
-  include/   burning_utility.h     public C API + C++ wrapper
-  examples/  c_example.c, cpp_example.cpp, csharp_example.cs
+  include/   burning_utility.h     public C API + C++ wrappers
+  examples/  c_example.c, cpp_example.cpp, csharp_example.cs, job_example.c
 
 Using the library
 -----------------
   Add include/ to your include path, link against lib/ on Windows, and keep
   the shared library next to your executable (or on the system library path)
-  at runtime. Run "burn_cli --help" for the available commands.
+  at runtime. Run "burn_cli" with no arguments for the available commands.
+
+Asynchronous jobs (recommended)
+-------------------------------
+  BurnJobOptions o;  memset(&o, 0, sizeof(o));
+  o.size = sizeof(o);  o.mode = BURN_JOB_MODE_IMAGE;
+  o.sourcePath = "disc.iso";  o.devicePath = "D:";
+
+  BurnJobHandle h = Burn_Start(&o);          // returns immediately
+  BurnJobStatus s; memset(&s, 0, sizeof(s)); s.size = sizeof(s);
+  Burn_GetStatus(h, &s);                     // state / percent / phase
+  Burn_Cancel(h);                            // from ANY thread
+  Burn_Wait(h, -1);                          // -1 = forever, 0 = poll only
+  Burn_Release(h);                           // mandatory, exactly once
+
+  Burn_Simple(&o, &s) is the one-call blocking shortcut. BurnTask is the C++
+  RAII wrapper (the destructor releases the handle). The older
+  CreateISOToDisc / BurnDirectoryToDisc / CreateISOImage functions remain as
+  a compatibility layer and can be interrupted with CancelCurrentBurn().
+
+  BURN_JOB_MODE_SELFTEST runs a ~2 second cooperative job that needs no
+  optical drive; use it to validate an integration ("burn_cli job-selftest"
+  or "burn_cli job-selftest cancel").
+
+  Burn_GetStatus() returns a plain snapshot with no pointers, so it stays
+  valid after Burn_Release(). A released handle is rejected with
+  BURN_ERROR_INVALID_HANDLE; it is never a dangling pointer.
+
+  Every exported C function and every caller-supplied progress callback is
+  wrapped in try/catch. Exceptions are reported as BURN_ERROR_EXCEPTION in
+  status.errorMessage rather than unwinding through the ABI.
+
+  No backend uses system() or a shell. Windows uses IMAPI2 with real
+  DDiscFormat2DataEvents progress and CancelWrite(); Linux uses libburn's
+  burn_drive_cancel(); macOS uses posix_spawnp() argv arrays and SIGTERM.
 
 Runtime dependencies
 --------------------
@@ -29,7 +65,10 @@ Runtime dependencies
 
 API notes
 ---------
-  GetPlatformInfo(), GetSupportedFormats() and GetLastErrorMessage() return
-  pointers to internal static buffers. Do NOT free them with
-  FreeStringMemory() -- that function is only for heap-allocated strings
-  returned through out-parameters.
+  GetPlatformInfo(), GetSupportedFormats(), GetLastErrorMessage() and
+  Burn_GetJobErrorMessage() return pointers to internal static buffers.
+  Do NOT free them with FreeStringMemory() -- that function is only for
+  heap-allocated strings returned through out-parameters.
+
+  Set options.size = sizeof(BurnJobOptions) and status.size =
+  sizeof(BurnJobStatus) before every call; this is the ABI version check.

@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.10)
-project(BurningDLL VERSION 1.0.0 LANGUAGES CXX)
+project(BurningDLL VERSION 1.0.0 LANGUAGES C CXX)
 
 set(PROJECT_NAME "BurningDLL")
 set(PROJECT_DESCRIPTION "Cross-platform burning utility DLL for Visual Studio 2017")
@@ -7,6 +7,9 @@ set(PROJECT_DESCRIPTION "Cross-platform burning utility DLL for Visual Studio 20
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
+
+# The job engine runs work on std::thread; the unit test also uses threads.
+find_package(Threads REQUIRED)
 
 if(MSVC)
     message(STATUS "Configuring for Visual Studio")
@@ -36,6 +39,7 @@ set(SOURCES
     src/windows_platform.cpp
     src/unix_platform.cpp
     src/mac_platform.cpp
+    src/burn_internal.h
 )
 
 set(HEADERS
@@ -43,6 +47,7 @@ set(HEADERS
 )
 
 add_library(${PROJECT_NAME} SHARED ${SOURCES} ${HEADERS})
+target_link_libraries(${PROJECT_NAME} PRIVATE Threads::Threads)
 
 set_target_properties(${PROJECT_NAME} PROPERTIES
     OUTPUT_NAME "burning_dll"
@@ -107,6 +112,16 @@ add_executable(burn_cli examples/burn_cli.cpp)
 target_link_libraries(burn_cli PRIVATE ${PROJECT_NAME})
 target_include_directories(burn_cli PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
 
+# Build the plain-C samples too. This is a compile-time guard that the public
+# header really is consumable from C (no unguarded C++ headers / types).
+add_executable(c_example examples/c_example.c)
+target_link_libraries(c_example PRIVATE ${PROJECT_NAME})
+target_include_directories(c_example PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+
+add_executable(job_example examples/job_example.c)
+target_link_libraries(job_example PRIVATE ${PROJECT_NAME})
+target_include_directories(job_example PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+
 # These are part of the downloadable SDK: the CLI lands in bin/ next to the
 # shared library, and the samples show how to consume the C/C++/C# APIs.
 install(TARGETS burn_cli RUNTIME DESTINATION bin)
@@ -114,6 +129,7 @@ install(FILES
     examples/c_example.c
     examples/cpp_example.cpp
     examples/csharp_example.cs
+    examples/job_example.c
     DESTINATION examples
 )
 
@@ -123,6 +139,13 @@ if(MSVC)
 endif()
 
 target_compile_features(${PROJECT_NAME} PUBLIC cxx_std_17)
+
+# The diagnostic job needs no optical drive, so it is safe to run in CI.
+# It exercises Start/GetStatus/Cancel/Wait/Release from plain C.
+add_test(NAME job_example_selftest COMMAND job_example)
+set_tests_properties(job_example_selftest PROPERTIES TIMEOUT 30 LABELS "job")
+add_test(NAME job_example_cancel COMMAND job_example cancel)
+set_tests_properties(job_example_cancel PROPERTIES TIMEOUT 30 LABELS "job")
 
 if(NOT CMAKE_BUILD_TYPE)
     set(CMAKE_BUILD_TYPE "Release" CACHE STRING "Build type" FORCE)

@@ -1,17 +1,15 @@
 #include "burning_utility.h"
+#include "burn_internal.h"
 #include <string>
 #include <vector>
 #include <memory>
 #include <cstring>
 #include <cstdlib>
 #include <cstdio>
+#include <mutex>
 #include <stdint.h>   /* libisofs.h needs uint32_t/uint8_t in global scope */
 /* NOTE: POSIX-only headers must stay inside the platform guard below —
  * this file is also compiled on Windows, where <unistd.h> does not exist. */
-
-/* Internal C++ helpers — NOT extern "C" (they take std::string) */
-void SetBurnLastError(const std::string& error);
-void NotifyProgressBurn(int percent, const char* status);
 
 /* libburn only supports Linux/FreeBSD/Solaris (no Darwin backend).
  * macOS uses the native hdiutil/drutil backend in mac_platform.cpp. */
@@ -57,6 +55,22 @@ void NotifyProgressBurn(int percent, const char* status);
  */
 
 using namespace burn;
+
+/* Native cancellation hook: burn_drive_cancel() requests an abort of the
+ * asynchronous burn_disc_write(). The polling loop below keeps waiting until
+ * the drive returns to IDLE before any libburn object is freed. */
+struct UnixCancelContext {
+    std::mutex mutex;
+    struct burn_drive* drive = nullptr;
+};
+
+static void UnixCancelHook(void* context) {
+    UnixCancelContext* ctx = static_cast<UnixCancelContext*>(context);
+    std::lock_guard<std::mutex> lock(ctx->mutex);
+    if (ctx->drive) {
+        burn_drive_cancel(ctx->drive);
+    }
+}
 
 namespace {
 
@@ -161,6 +175,10 @@ public:
             SetBurnLastError("libburn is not initialized");
             return false;
         }
+        if (IsBurnCancelled()) {
+            SetBurnLastError("Burn cancelled by caller");
+            return false;
+        }
         NotifyProgressBurn(10, "Initializing burn process...");
 
         /* burn_drive_scan_and_grab takes struct burn_drive_info *drive_infos[],
@@ -239,43 +257,63 @@ public:
 
         /* burn_write_opts_auto_write_type() chooses AND applies the write
          * type; upstream requires it immediately before burn_disc_write().
-         * This call was missing entirely — the old code polled a drive that
-         * was never told to write, so Linux burns were a silent no-op. */
-        burn_disc_write(opts, disc);
+         * This call was missing entirely in an earlier revision — the old
+         * code polled a drive that was never told to write, so Linux burns
+         * were a silent no-op. */
+        UnixCancelContext cancelCtx;
+        {
+            std::lock_guard<std::mutex> lock(cancelCtx.mutex);
+            cancelCtx.drive = drive;
+        }
+        SetBurnCancelHook(UnixCancelHook, &cancelCtx);
 
-        /* burn_disc_write() returns void and starts the asynchronous write.
-         * Poll burn_drive_get_status() until the drive goes IDLE. It passes
-         * through SPAWNING, WRITING*, CLOSING_TRACK and CLOSING_SESSION;
-         * any non-IDLE status keeps the loop alive (including SPAWNING,
-         * which covers the startup race before the writer thread begins). */
-        struct burn_progress progress;
-        enum burn_drive_status drive_status;
-        while ((drive_status = burn_drive_get_status(drive, &progress)) != BURN_DRIVE_IDLE) {
-            if (drive_status == BURN_DRIVE_WRITING ||
-                drive_status == BURN_DRIVE_WRITING_LEADIN ||
-                drive_status == BURN_DRIVE_WRITING_LEADOUT ||
-                drive_status == BURN_DRIVE_WRITING_PREGAP ||
-                drive_status == BURN_DRIVE_CLOSING_TRACK ||
-                drive_status == BURN_DRIVE_CLOSING_SESSION) {
-                /* struct burn_progress uses .sectors (total) and .sector
-                 * (current). Report the real 0..99% instead of faking 50%. */
-                int percent = progress.sectors > 0
-                    ? (int)(progress.sector * 100.0 / progress.sectors)
-                    : 0;
-                if (percent < 0) percent = 0;
-                if (percent > 99) percent = 99;
-                char buf[128];
-                snprintf(buf, sizeof(buf), "Burning... %d%%", percent);
-                NotifyProgressBurn(percent, buf);
+        bool cancelled = IsBurnCancelled();
+        if (!cancelled) {
+            /* burn_disc_write() returns void and starts the asynchronous
+             * write. Progress is polled through burn_drive_get_status(). */
+            burn_disc_write(opts, disc);
+
+            struct burn_progress progress;
+            enum burn_drive_status drive_status;
+            while ((drive_status = burn_drive_get_status(drive, &progress)) != BURN_DRIVE_IDLE) {
+                if (IsBurnCancelled() && !cancelled) {
+                    cancelled = true;
+                    burn_drive_cancel(drive);
+                    NotifyProgressBurn(0, "Cancelling burn...");
+                }
+                if (!cancelled &&
+                    (drive_status == BURN_DRIVE_WRITING ||
+                     drive_status == BURN_DRIVE_WRITING_LEADIN ||
+                     drive_status == BURN_DRIVE_WRITING_LEADOUT ||
+                     drive_status == BURN_DRIVE_WRITING_PREGAP ||
+                     drive_status == BURN_DRIVE_CLOSING_TRACK ||
+                     drive_status == BURN_DRIVE_CLOSING_SESSION)) {
+                    /* struct burn_progress uses .sectors (total) and .sector
+                     * (current). Report the real 0..99% instead of faking 50%. */
+                    int percent = progress.sectors > 0
+                        ? (int)(progress.sector * 100.0 / progress.sectors)
+                        : 0;
+                    if (percent < 0) percent = 0;
+                    if (percent > 99) percent = 99;
+                    char buf[128];
+                    snprintf(buf, sizeof(buf), "Burning... %d%%", percent);
+                    NotifyProgressBurn(percent, buf);
+                }
+                usleep(100000);
             }
-            usleep(100000);
         }
 
+        /* Neutralise the hook before clearing it, so a late Burn_Cancel()
+         * cannot call burn_drive_cancel() on a released drive. */
+        {
+            std::lock_guard<std::mutex> lock(cancelCtx.mutex);
+            cancelCtx.drive = nullptr;
+        }
+        ClearBurnCancelHook(UnixCancelHook, &cancelCtx);
+
         /* burn_drive_wrote_well() is the authoritative result of the most
-         * recent asynchronous burn_disc_write() (1 = ok, 0 = failed). The
-         * previous burn_disc_get_status() heuristic was unreliable because
-         * the drive may still report the pre-write media state here. */
-        bool burn_ok = (burn_drive_wrote_well(drive) > 0);
+         * recent asynchronous burn_disc_write() (1 = ok, 0 = failed). */
+        bool burn_ok = !cancelled && (burn_drive_wrote_well(drive) > 0);
 
         burn_write_opts_free(opts);
         burn_track_free(track);
@@ -285,8 +323,13 @@ public:
         burn_drive_info_free(drive_info);
 
         if (!burn_ok) {
-            SetBurnLastError("Burn failed — disc is not readable after write");
-            NotifyProgressBurn(100, "Burn failed");
+            if (cancelled) {
+                SetBurnLastError("Burn cancelled by caller");
+                NotifyProgressBurn(0, "Burn cancelled");
+            } else {
+                SetBurnLastError("Burn failed — disc is not readable after write");
+                NotifyProgressBurn(100, "Burn failed");
+            }
             return false;
         }
 
@@ -298,6 +341,10 @@ public:
                    const std::string& volumeLabel) override {
         if (!isoReady_) {
             SetBurnLastError("libisofs is not initialized");
+            return false;
+        }
+        if (IsBurnCancelled()) {
+            SetBurnLastError("ISO creation cancelled by caller");
             return false;
         }
         NotifyProgressBurn(10, "Creating ISO image...");
@@ -372,7 +419,12 @@ public:
 
         char buf[65536];
         off_t written = 0;
+        bool cancelled = false;
         while (written < total) {
+            if (IsBurnCancelled()) {
+                cancelled = true;
+                break;
+            }
             int to_read = (int)((total - written > (off_t)sizeof(buf))
                                 ? sizeof(buf) : total - written);
             int r = -1;
@@ -397,6 +449,17 @@ public:
         iso_write_opts_free(opts);
         fclose(f);
         iso_image_unref(image);
+
+        if (cancelled) {
+            remove(isoPath.c_str());
+            SetBurnLastError("ISO creation cancelled by caller");
+            return false;
+        }
+        if (written < total) {
+            remove(isoPath.c_str());
+            SetBurnLastError("ISO image was truncated while writing");
+            return false;
+        }
 
         NotifyProgressBurn(100, "ISO creation completed");
         return true;
