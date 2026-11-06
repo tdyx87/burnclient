@@ -15,6 +15,8 @@ extern "C" void NotifyProgressBurn(int percent, const char* status);
 #include <libburn/libburn.h>
 #include <libisofs/libisofs.h>
 
+using namespace burn;
+
 class UnixPlatform : public IPlatform {
 public:
     UnixPlatform() {
