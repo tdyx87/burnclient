@@ -15,7 +15,7 @@ extern "C" void NotifyProgressBurn(int percent, const char* status);
 #include <libburn/libburn.h>
 #include <libisofs/libisofs.h>
 
-using namespace burn;
+/* libburn and libisofs are pure C libraries — no namespace */
 
 class UnixPlatform : public IPlatform {
 public:
@@ -32,17 +32,24 @@ public:
 
     std::vector<DeviceInfo> ListDevices() override {
         std::vector<DeviceInfo> devices;
-        struct burn_drive_info **drive_list = nullptr;
+
+        struct burn_drive_info *drive_list = nullptr;
         unsigned int drive_count = 0;
 
-        if (burn_drive_scan(drive_list, &drive_count) <= 0) {
+        /* burn_drive_scan is async — wait for it to complete */
+        while (burn_drive_scan(&drive_list, &drive_count) == 0) {
+            usleep(100000); /* 100ms poll */
+        }
+
+        if (drive_count == 0) {
             SetBurnLastError("No drives found");
+            /* Provide a sensible fallback so callers still get a device path */
             DeviceInfo info = {};
             info.isWritable = 1;
             info.isEmpty = 1;
-            strcpy(info.mediaType, "CD/DVD");
-            strcpy(info.devicePath, "/dev/sr0");
-            strcpy(info.deviceName, "Default Optical Drive");
+            strncpy(info.mediaType, "CD/DVD", sizeof(info.mediaType) - 1);
+            strncpy(info.devicePath, "/dev/sr0", sizeof(info.devicePath) - 1);
+            strncpy(info.deviceName, "Default Optical Drive", sizeof(info.deviceName) - 1);
             devices.push_back(info);
             return devices;
         }
@@ -51,8 +58,8 @@ public:
             DeviceInfo info = {};
             info.isWritable = 1;
             info.isEmpty = 1;
-            strcpy(info.mediaType, "CD/DVD");
-            snprintf(info.devicePath, sizeof(info.devicePath), "%s", (*drive_list)[i].location);
+            strncpy(info.mediaType, "CD/DVD", sizeof(info.mediaType) - 1);
+            snprintf(info.devicePath, sizeof(info.devicePath), "%s", drive_list[i].location);
             snprintf(info.deviceName, sizeof(info.deviceName), "Optical Drive %u", i);
             devices.push_back(info);
         }
@@ -98,6 +105,8 @@ public:
         struct burn_source *src = burn_file_source_new(isoPath.c_str(), NULL);
         if (!src) {
             SetBurnLastError("Failed to create burn source from ISO");
+            burn_session_free(session);
+            burn_disc_free(disc);
             burn_drive_release(drive, 0);
             return false;
         }
@@ -112,6 +121,8 @@ public:
         if (burn_disc_write(opts, disc) <= 0) {
             SetBurnLastError("Burn write failed");
             burn_write_opts_free(opts);
+            burn_track_free(track);
+            burn_session_free(session);
             burn_disc_free(disc);
             burn_drive_release(drive, 0);
             return false;
@@ -131,6 +142,8 @@ public:
         }
 
         burn_write_opts_free(opts);
+        burn_track_free(track);
+        burn_session_free(session);
         burn_disc_free(disc);
         burn_drive_release(drive, 0);
 
@@ -161,6 +174,7 @@ public:
 
         NotifyProgressBurn(50, "Writing ISO file...");
 
+        /* Single opts instance — no duplicate creation */
         IsoWriteOpts *opts = nullptr;
         iso_write_opts_new(&opts, 0);
         iso_write_opts_set_iso_level(opts, 3);
@@ -175,34 +189,28 @@ public:
             return false;
         }
 
-        // Use libisofs dump to file via iso_image_create_burn_source + iso_burn
-        // Simplified: write using iso_image_dump (if available) or fallback
-        // For portability, use iso_write (libisoburn) approach
-        IsoWriteOpts *wopts = nullptr;
-        iso_write_opts_new(&wopts, 0);
-        iso_write_opts_set_iso_level(wopts, 3);
-        iso_write_opts_set_rockridge(wopts, 1);
-        iso_write_opts_set_joliet(wopts, 1);
-
-        // Dump image to file using libisofs iso_image_create_burn_source
-        IsoBurnSource *burn_src = nullptr;
-        ret = iso_image_create_burn_source(image, wopts, &burn_src);
-        if (ret < 0) {
+        /* libisofs: iso_image_create_burn_source returns a burn_source via
+           IsoBurnSource** which is actually struct burn_source** in libisofs.
+           We cast accordingly. */
+        struct burn_source *burn_src = nullptr;
+        ret = iso_image_create_burn_source(image, opts, (IsoBurnSource**)&burn_src);
+        if (ret < 0 || !burn_src) {
             SetBurnLastError("Failed to create burn source");
-            iso_write_opts_free(wopts);
+            iso_write_opts_free(opts);
             iso_image_unref(image);
             fclose(f);
             return false;
         }
 
         char buf[65536];
-        int64_t total = burn_src->size;
-        int64_t written = 0;
+        off_t total = burn_src->size;
+        off_t written = 0;
         while (written < total) {
-            size_t to_read = (total - written > (int64_t)sizeof(buf)) ? sizeof(buf) : (size_t)(total - written);
-            size_t r = burn_src->read(burn_src, buf, to_read);
+            size_t to_read = (size_t)((total - written > (off_t)sizeof(buf))
+                                      ? sizeof(buf) : total - written);
+            int r = burn_src->read(burn_src, buf, to_read);
             if (r <= 0) break;
-            fwrite(buf, 1, r, f);
+            fwrite(buf, 1, (size_t)r, f);
             written += r;
             int pct = total > 0 ? (int)(written * 100 / total) : 100;
             if (pct > 50 && pct < 100) {
@@ -212,11 +220,11 @@ public:
             }
         }
 
-        burn_src->free(burn_src);
-        iso_write_opts_free(wopts);
-
-        fclose(f);
+        if (burn_src->free) {
+            burn_src->free(burn_src);
+        }
         iso_write_opts_free(opts);
+        fclose(f);
         iso_image_unref(image);
 
         NotifyProgressBurn(100, "ISO creation completed");
@@ -228,7 +236,17 @@ public:
     }
 
     bool CheckToolAvailability(const std::string& toolName) override {
-        return true;
+        /* Check common bin directories for an executable */
+        const char* dirs[] = {
+            "/usr/bin/", "/usr/local/bin/", "/opt/local/bin/", "/bin/", nullptr
+        };
+        for (int i = 0; dirs[i]; ++i) {
+            std::string full = std::string(dirs[i]) + toolName;
+            if (access(full.c_str(), X_OK) == 0) {
+                return true;
+            }
+        }
+        return false;
     }
 };
 
@@ -236,4 +254,4 @@ std::unique_ptr<IPlatform> CreatePlatformImpl() {
     return std::make_unique<UnixPlatform>();
 }
 
-#endif
+#endif /* _WIN32 */

@@ -5,7 +5,7 @@
 #include <vector>
 #include <memory>
 
-// DeviceInfo struct
+/* DeviceInfo struct — plain C-compatible, safe across DLL boundary */
 typedef struct {
     char devicePath[512];
     char deviceName[256];
@@ -25,12 +25,19 @@ typedef struct {
 #endif
 
 #ifdef __cplusplus
-// Platform abstraction interface (C++ only, not extern "C")
-class DLL_API IPlatform {
+/* ---------------------------------------------------------------------------
+ * Platform abstraction interface (C++ only, internal — not exported)
+ *
+ * Note: IPlatform uses std::string/std::vector in its interface, which are
+ * ABI-sensitive. It is NOT marked DLL_API because it is only used internally
+ * via CreatePlatformImpl() within the DLL. Callers interact through the
+ * C API or the BurningUtility wrapper class.
+ * ------------------------------------------------------------------------- */
+class IPlatform {
 public:
     virtual ~IPlatform() = default;
     virtual std::vector<DeviceInfo> ListDevices() = 0;
-    virtual bool BurnISO(const std::string& isoPath, const std::string& devicePath, 
+    virtual bool BurnISO(const std::string& isoPath, const std::string& devicePath,
                          const std::string& discType, int speed) = 0;
     virtual bool CreateISO(const std::string& sourcePath, const std::string& isoPath,
                           const std::string& volumeLabel) = 0;
@@ -38,7 +45,8 @@ public:
     virtual bool CheckToolAvailability(const std::string& toolName) = 0;
 };
 
-DLL_API std::unique_ptr<IPlatform> CreatePlatformImpl();
+/* Internal factory — called only within the DLL, not exported */
+std::unique_ptr<IPlatform> CreatePlatformImpl();
 #endif
 
 #ifdef __cplusplus
@@ -77,6 +85,11 @@ DLL_API void SetDefaultSpeed(int speed);
 DLL_API const char* GetLastErrorMessage();
 DLL_API void ClearLastError();
 
+/* FreeStringMemory: only for strings that were dynamically allocated
+ * and returned as non-const char* from the DLL. Do NOT use on return
+ * values of GetPlatformInfo(), GetSupportedFormats(), or
+ * GetLastErrorMessage() — those return pointers to internal static
+ * buffers and must not be freed. */
 DLL_API void FreeStringMemory(void* ptr);
 
 DLL_API void SetProgressCallback(BurnProgressCallback callback, void* userData);
@@ -89,32 +102,35 @@ DLL_API void SetProgressCallback(BurnProgressCallback callback, void* userData);
 #include <string>
 #include <vector>
 
+/* C++ convenience wrapper class.
+ * Uses pImpl idiom to hide implementation details and avoid exporting
+ * STL types across the DLL boundary. */
 class DLL_API BurningUtility {
 public:
     BurningUtility();
     ~BurningUtility();
-    
-    bool CreateISOToDisc(const std::string& isoPath, const std::string& devicePath, 
+
+    bool CreateISOToDisc(const std::string& isoPath, const std::string& devicePath,
                         const std::string& discType = "CD-R", int speed = 4);
     bool BurnDirectoryToDisc(const std::string& sourceDir, const std::string& devicePath,
                             const std::string& discType = "CD-R", int speed = 4);
     bool CreateISOImage(const std::string& sourcePath, const std::string& isoPath,
                        const std::string& volumeLabel = "DISC");
     bool VerifyDisc(const std::string& devicePath, const std::string& isoPath);
-    
+
     std::vector<DeviceInfo> ListBurningDevices();
     std::string GetDefaultDevice();
     std::string GetPlatformInfo();
-    
+
     bool CheckToolAvailability(const std::string& toolName);
     std::string GetSupportedFormats();
     bool ValidateSourcePath(const std::string& path);
-    
+
     void SetDefaultDevice(const std::string& device);
     void SetDefaultDiscType(const std::string& discType);
     void SetDefaultSpeed(int speed);
     void SetProgressCallback(BurnProgressCallback callback, void* userData);
-    
+
     std::string GetLastErrorMessage();
     void ClearLastError();
 

@@ -50,3 +50,6 @@ test_results/
 # OS
 .DS_Store
 Thumbs.db
+
+# Windows reserved names
+NUL

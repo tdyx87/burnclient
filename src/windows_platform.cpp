@@ -41,9 +41,9 @@ public:
             DeviceInfo info = {};
             info.isWritable = 1;
             info.isEmpty = 1;
-            strcpy(info.mediaType, "CD/DVD");
-            strcpy(info.devicePath, "D:");
-            strcpy(info.deviceName, "Default Optical Drive");
+            strncpy(info.mediaType, "CD/DVD", sizeof(info.mediaType) - 1);
+            strncpy(info.devicePath, "D:", sizeof(info.devicePath) - 1);
+            strncpy(info.deviceName, "Default Optical Drive", sizeof(info.deviceName) - 1);
             devices.push_back(info);
             return devices;
         }
@@ -64,7 +64,7 @@ public:
                             DeviceInfo info = {};
                             info.isWritable = 1;
                             info.isEmpty = 1;
-                            strcpy(info.mediaType, "CD/DVD");
+                            strncpy(info.mediaType, "CD/DVD", sizeof(info.mediaType) - 1);
 
                             BSTR volPath = nullptr;
                             pRecorder->get_VolumePathNames(&volPath);
@@ -72,7 +72,7 @@ public:
                                 WideCharToMultiByte(CP_UTF8, 0, volPath, -1, info.devicePath, 511, nullptr, nullptr);
                                 SysFreeString(volPath);
                             } else {
-                                strcpy(info.devicePath, "D:");
+                                strncpy(info.devicePath, "D:", sizeof(info.devicePath) - 1);
                             }
 
                             BSTR prodId = nullptr;
@@ -81,7 +81,7 @@ public:
                                 WideCharToMultiByte(CP_UTF8, 0, prodId, -1, info.deviceName, 255, nullptr, nullptr);
                                 SysFreeString(prodId);
                             } else {
-                                strcpy(info.deviceName, "Optical Drive");
+                                strncpy(info.deviceName, "Optical Drive", sizeof(info.deviceName) - 1);
                             }
 
                             devices.push_back(info);
@@ -108,6 +108,8 @@ public:
             return false;
         }
 
+        /* Find the recorder whose volume path matches devicePath.
+         * Only match exactly — do not fall back to the first device. */
         IDiscRecorder2* pRecorder = nullptr;
         long count = 0;
         pDiscMaster->get_Count(&count);
@@ -126,9 +128,12 @@ public:
                             WideCharToMultiByte(CP_UTF8, 0, volPath, -1, path, 511, nullptr, nullptr);
                             SysFreeString(volPath);
                         }
-                        if (strcmp(path, devicePath.c_str()) == 0 || !pRecorder) {
+                        if (strcmp(path, devicePath.c_str()) == 0) {
+                            /* Exact match — use this recorder */
                             if (pRecorder) pRecorder->Release();
                             pRecorder = pRec;
+                            /* Keep going to check remaining devices,
+                               but this is our match */
                         } else {
                             pRec->Release();
                         }
@@ -149,6 +154,9 @@ public:
         NotifyProgressBurn(30, "Preparing disc...");
 
         if (speed > 0) {
+            /* IMAPI2 write speed is in sectors per second.
+             * CD: 1x = 150 sectors/s, DVD: 1x = ~1385 sectors/s.
+             * Use a reasonable approximation. */
             pRecorder->put_RequestedWriteSpeed(speed * 1000);
         }
 
@@ -208,6 +216,7 @@ public:
             return false;
         }
 
+        /* Set volume name */
         int wlen = MultiByteToWideChar(CP_UTF8, 0, volumeLabel.c_str(), -1, nullptr, 0);
         if (wlen > 0) {
             wchar_t* wbuf = new wchar_t[wlen];
@@ -220,14 +229,27 @@ public:
 
         pFsImage->put_FileSystemsToCreate(FsiFileSystemISO9660 | FsiFileSystemJoliet);
 
-        int slen = MultiByteToWideChar(CP_UTF8, 0, sourcePath.c_str(), -1, nullptr, 0);
-        if (slen > 0) {
-            wchar_t* wbuf = new wchar_t[slen];
-            MultiByteToWideChar(CP_UTF8, 0, sourcePath.c_str(), -1, wbuf, slen);
-            BSTR bstrSource = SysAllocString(wbuf);
-            pFsImage->put_ImportedDirectoryItems(bstrSource);
-            SysFreeString(bstrSource);
-            delete[] wbuf;
+        /* Correct API: use IFsiDirectoryItem->AddTree to import a directory.
+         * put_ImportedDirectoryItems does NOT accept a single path string. */
+        IFsiDirectoryItem* pRootDir = nullptr;
+        hr = pFsImage->get_Root(&pRootDir);
+        if (SUCCEEDED(hr) && pRootDir) {
+            int slen = MultiByteToWideChar(CP_UTF8, 0, sourcePath.c_str(), -1, nullptr, 0);
+            if (slen > 0) {
+                wchar_t* wbuf = new wchar_t[slen];
+                MultiByteToWideChar(CP_UTF8, 0, sourcePath.c_str(), -1, wbuf, slen);
+                BSTR bstrSource = SysAllocString(wbuf);
+                /* AddTree: include the directory contents, not the directory itself */
+                hr = pRootDir->AddTree(bstrSource, VARIANT_FALSE);
+                if (FAILED(hr)) {
+                    SetBurnLastError("Failed to add source directory to ISO image");
+                }
+                SysFreeString(bstrSource);
+                delete[] wbuf;
+            }
+            pRootDir->Release();
+        } else {
+            SetBurnLastError("Failed to get root directory of ISO image");
         }
 
         NotifyProgressBurn(50, "Writing ISO file...");
@@ -269,7 +291,15 @@ public:
     }
 
     bool CheckToolAvailability(const std::string& toolName) override {
-        return true;
+        /* Search for the executable in the system PATH */
+        char path[MAX_PATH] = {0};
+        DWORD len = SearchPathA(NULL, toolName.c_str(), ".exe", MAX_PATH, path, NULL);
+        if (len > 0 && len < MAX_PATH) {
+            return true;
+        }
+        /* Also check without .exe extension (might be a direct path) */
+        DWORD attr = GetFileAttributesA(toolName.c_str());
+        return attr != INVALID_FILE_ATTRIBUTES;
     }
 };
 
