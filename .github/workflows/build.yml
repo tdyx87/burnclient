@@ -3,9 +3,16 @@ name: Build and Test
 on:
   push:
     branches: [ main, master ]
+    tags: [ 'v*' ]
   pull_request:
     branches: [ main, master ]
   workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  VERSION: 1.0.0
 
 jobs:
   build-windows:
@@ -14,53 +21,84 @@ jobs:
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
+
       - name: Configure CMake
         # Let CMake pick the installed Visual Studio generator instead of
         # pinning "Visual Studio 15 2017" (not present on current images).
         run: cmake -S . -B build
+
       - name: Build
         run: cmake --build build --config Release
+
       - name: Test
         run: ctest --test-dir build -C Release --output-on-failure
+
+      # Stage a complete SDK (DLL, import lib, public header, CLI, samples,
+      # README) and pack it into ONE archive. Uploading build/bin/** directly
+      # used to produce empty or unusable artifacts when globs did not match.
+      - name: Package SDK
+        shell: pwsh
+        run: |
+          cmake --install build --config Release --prefix "$env:GITHUB_WORKSPACE/dist"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $short = "$env:GITHUB_SHA".Substring(0, 7)
+          $name = "BurningDLL-$env:VERSION-$short-windows-x64"
+          New-Item -ItemType Directory -Force -Path release | Out-Null
+          Compress-Archive -Path "$env:GITHUB_WORKSPACE/dist/*" -DestinationPath "release/$name.zip" -Force
+          Get-ChildItem release | Select-Object Name, Length | Format-Table -AutoSize
+
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: windows-dll
-          if-no-files-found: ignore
-          path: |
-            build/bin/**/*.dll
-            build/bin/**/*.exe
-            build/lib/**/*.dll
+          name: sdk-windows-x64
+          path: release/*.zip
+          if-no-files-found: error
+          retention-days: 90
 
   build-linux:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
+
       - name: Install dependencies
         run: |
           sudo apt-get update
           sudo apt-get install -y build-essential cmake pkg-config libburn-dev libisofs-dev
+
       - name: Configure CMake
         run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+
       - name: Build
         run: cmake --build build --parallel
+
       - name: Test
         run: ctest --test-dir build --output-on-failure
+
+      - name: Package SDK
+        run: |
+          set -euo pipefail
+          cmake --install build --prefix "$GITHUB_WORKSPACE/dist"
+          SHORT="${GITHUB_SHA::7}"
+          NAME="BurningDLL-${VERSION}-${SHORT}-linux-x64"
+          mkdir -p release
+          tar -czf "release/${NAME}.tar.gz" -C dist .
+          ls -lh release
+
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: linux-so
-          if-no-files-found: ignore
-          path: |
-            build/lib/*.so*
-            build/bin/*
+          name: sdk-linux-x64
+          path: release/*.tar.gz
+          if-no-files-found: error
+          retention-days: 90
 
   build-macos:
     runs-on: macos-latest
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
+
       # No Homebrew packages: libburn has no Darwin backend and Homebrew has
       # no libburn/libisoburn formula. src/mac_platform.cpp uses the native
       # hdiutil/drutil tools, so only the Apple toolchain is required.
@@ -69,9 +107,63 @@ jobs:
           cmake --version
           command -v hdiutil
           command -v drutil
+
       - name: Configure CMake
         run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+
       - name: Build
         run: cmake --build build --parallel
+
       - name: Test
         run: ctest --test-dir build --output-on-failure
+
+      - name: Package SDK
+        run: |
+          set -euo pipefail
+          cmake --install build --prefix "$GITHUB_WORKSPACE/dist"
+          SHORT="${GITHUB_SHA::7}"
+          NAME="BurningDLL-${VERSION}-${SHORT}-macos"
+          mkdir -p release
+          tar -czf "release/${NAME}.tar.gz" -C dist .
+          ls -lh release
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: sdk-macos
+          path: release/*.tar.gz
+          if-no-files-found: error
+          retention-days: 90
+
+  # Actions artifacts require a GitHub login and expire after 90 days. A tag
+  # push publishes the very same archives as a public Release, giving stable
+  # download URLs that work without authentication.
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [build-windows, build-linux, build-macos]
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: write
+    steps:
+      - name: Download all SDK archives
+        uses: actions/download-artifact@v4
+        with:
+          path: release-assets
+          merge-multiple: true
+
+      - name: Generate checksums
+        run: |
+          set -euo pipefail
+          cd release-assets
+          sha256sum BurningDLL-* > SHA256SUMS.txt
+          cat SHA256SUMS.txt
+
+      - name: Publish GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" release-assets/* \
+            --title "$GITHUB_REF_NAME" \
+            --generate-notes

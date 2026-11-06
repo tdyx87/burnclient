@@ -1,0 +1,35 @@
+BurningDLL @PROJECT_VERSION@
+Built for: @CMAKE_SYSTEM_NAME@ / @CMAKE_CXX_COMPILER_ID@ / @CMAKE_BUILD_TYPE@
+
+Cross-platform disc-burning utility (C API + BurningUtility C++ wrapper).
+
+Contents
+--------
+  bin/       burning_dll.dll | libburning_dll.so* | libburning_dll*.dylib
+             burn_cli              command-line example, needs the shared lib
+  lib/       burning_dll.lib       Windows import library only
+  include/   burning_utility.h     public C API + C++ wrapper
+  examples/  c_example.c, cpp_example.cpp, csharp_example.cs
+
+Using the library
+-----------------
+  Add include/ to your include path, link against lib/ on Windows, and keep
+  the shared library next to your executable (or on the system library path)
+  at runtime. Run "burn_cli --help" for the available commands.
+
+Runtime dependencies
+--------------------
+  Windows : IMAPI2 ships with Windows, nothing extra to distribute.
+  Linux   : libburn + libisofs runtime packages must be installed on the
+            target (Debian/Ubuntu: libburn4 / libisofs6 or equivalents).
+  macOS   : uses the built-in hdiutil / drutil tools; no third-party runtime.
+
+  A real optical drive is required for burning; listing devices works
+  without media.
+
+API notes
+---------
+  GetPlatformInfo(), GetSupportedFormats() and GetLastErrorMessage() return
+  pointers to internal static buffers. Do NOT free them with
+  FreeStringMemory() -- that function is only for heap-allocated strings
+  returned through out-parameters.

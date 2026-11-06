@@ -3,6 +3,11 @@ build/
 build_*/
 cmake-build-*/
 
+# Packaging / downloadable SDK staging
+dist/
+release/
+release-assets/
+
 # Visual Studio
 *.suo
 *.user

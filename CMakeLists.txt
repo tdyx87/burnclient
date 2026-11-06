@@ -87,7 +87,17 @@ install(TARGETS ${PROJECT_NAME}
     PUBLIC_HEADER DESTINATION include
 )
 
-install(FILES ${HEADERS} DESTINATION include)
+# The public header is installed by the PUBLIC_HEADER rule above; do not
+# install it a second time here.
+
+# A short manifest is generated at configure time so that every downloadable
+# package states its version and target platform.
+configure_file(
+    ${CMAKE_CURRENT_SOURCE_DIR}/packaging/README.txt.in
+    ${CMAKE_CURRENT_BINARY_DIR}/packaging/README.txt
+    @ONLY
+)
+install(FILES ${CMAKE_CURRENT_BINARY_DIR}/packaging/README.txt DESTINATION .)
 
 enable_testing()
 add_subdirectory(tests)
@@ -96,6 +106,16 @@ add_subdirectory(tests)
 add_executable(burn_cli examples/burn_cli.cpp)
 target_link_libraries(burn_cli PRIVATE ${PROJECT_NAME})
 target_include_directories(burn_cli PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+
+# These are part of the downloadable SDK: the CLI lands in bin/ next to the
+# shared library, and the samples show how to consume the C/C++/C# APIs.
+install(TARGETS burn_cli RUNTIME DESTINATION bin)
+install(FILES
+    examples/c_example.c
+    examples/cpp_example.cpp
+    examples/csharp_example.cs
+    DESTINATION examples
+)
 
 if(MSVC)
     set_property(GLOBAL PROPERTY USE_FOLDERS ON)
