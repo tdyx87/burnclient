@@ -259,7 +259,7 @@ public:
         }
 
         /* Find the recorder whose volume path matches devicePath.
-         * Only match exactly — do not fall back to the first device. */
+         * Only match exactly - do not fall back to the first device. */
         IDiscRecorder2* pRecorder = nullptr;
         long count = 0;
         pDiscMaster->get_Count(&count);
@@ -472,7 +472,7 @@ public:
                 }
                 fclose(f);
                 /* A cancelled or truncated write must not be reported as a
-                 * usable image — remove the partial file. */
+                 * usable image - remove the partial file. */
                 if (IsBurnCancelled()) {
                     remove(isoPath.c_str());
                     SetBurnLastError("ISO creation cancelled by caller");

@@ -8,7 +8,7 @@
 #include <cstdio>
 #include <mutex>
 #include <stdint.h>   /* libisofs.h needs uint32_t/uint8_t in global scope */
-/* NOTE: POSIX-only headers must stay inside the platform guard below —
+/* NOTE: POSIX-only headers must stay inside the platform guard below -
  * this file is also compiled on Windows, where <unistd.h> does not exist. */
 
 /* libburn only supports Linux/FreeBSD/Solaris (no Darwin backend).
@@ -91,7 +91,7 @@ public:
     UnixPlatform() {
         /* burn_initialize() returns 1 on success; iso_init() returns >= 0.
          * CI machines / containers usually have no optical drives and may
-         * not permit libburn to initialize — never call into the library
+         * not permit libburn to initialize - never call into the library
          * when it failed to start. */
         burnReady_ = (burn_initialize() != 0);
         if (!burnReady_) {
@@ -128,7 +128,7 @@ public:
         struct burn_drive_info *drive_list = nullptr;
         unsigned int drive_count = 0;
 
-        /* burn_drive_scan is asynchronous — must poll until it returns nonzero.
+        /* burn_drive_scan is asynchronous - must poll until it returns nonzero.
          * 0 = still scanning, >0 = done, <0 = error */
         int scan_ret;
         while ((scan_ret = burn_drive_scan(&drive_list, &drive_count)) == 0) {
@@ -189,7 +189,7 @@ public:
          * a mutable NUL-terminated copy. Note: it calls
          * burn_drive_clear_whitelist() + burn_drive_add_whitelist(adr)
          * internally, so calling burn_drive_add_whitelist() here is
-         * redundant — that is why the whitelist call was removed. */
+         * redundant - that is why the whitelist call was removed. */
         std::vector<char> deviceAdr(devicePath.begin(), devicePath.end());
         deviceAdr.push_back('\0');
 
@@ -257,7 +257,7 @@ public:
 
         /* burn_write_opts_auto_write_type() chooses AND applies the write
          * type; upstream requires it immediately before burn_disc_write().
-         * This call was missing entirely in an earlier revision — the old
+         * This call was missing entirely in an earlier revision - the old
          * code polled a drive that was never told to write, so Linux burns
          * were a silent no-op. */
         UnixCancelContext cancelCtx;
@@ -327,7 +327,7 @@ public:
                 SetBurnLastError("Burn cancelled by caller");
                 NotifyProgressBurn(0, "Burn cancelled");
             } else {
-                SetBurnLastError("Burn failed — disc is not readable after write");
+                SetBurnLastError("Burn failed - disc is not readable after write");
                 NotifyProgressBurn(100, "Burn failed");
             }
             return false;
@@ -410,8 +410,8 @@ public:
          *   off_t (*get_size)(struct burn_source *);
          *   void  (*free_data)(struct burn_source *);
          *   int   version; int (*read_xt)(...); int (*cancel)(...);
-         * There is NO .size field — must call get_size().
-         * There is NO .free field — must call burn_source_free(). */
+         * There is NO .size field - must call get_size().
+         * There is NO .free field - must call burn_source_free(). */
         off_t total = 0;
         if (burn_src->get_size) {
             total = burn_src->get_size(burn_src);

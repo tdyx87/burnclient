@@ -98,7 +98,7 @@ static unsigned long long NowMs() {
 }
 
 /* ---------------------------------------------------------------------------
- * BurnJob — internal state machine
+ * BurnJob - internal state machine
  *
  * PENDING -> RUNNING -> COMPLETED | FAILED | CANCELLED
  *
@@ -684,7 +684,7 @@ int CheckToolAvailability(const char* toolName) {
 
 const char* GetSupportedFormats() {
     try {
-        /* A string literal — callers must NOT call FreeStringMemory on it. */
+        /* A string literal - callers must NOT call FreeStringMemory on it. */
         return "CD-R, CD-RW, DVD-R, DVD+R, DVD-RW, DVD+RW, DVD-RAM, BD-R, BD-RE";
     } catch (...) {
         return "Internal exception";

@@ -207,7 +207,7 @@ public:
 
         /* drutil writes a table to stdout. Rather than depend on its exact
          * column layout (which differs between macOS releases), expose the
-         * default burner — drutil burn targets it when no -drive is given. */
+         * default burner - drutil burn targets it when no -drive is given. */
         bool hasBurner = (rc == 0 &&
                           output.find("No") == std::string::npos &&
                           !output.empty());
