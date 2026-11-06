@@ -1,0 +1,334 @@
+#include "burning_utility.h"
+#include <string>
+#include <vector>
+#include <map>
+#include <memory>
+#include <cstring>
+#include <cstdlib>
+#include <cstdio>
+
+static thread_local std::string g_lastError;
+static std::string g_defaultDevice = "";
+static std::string g_defaultDiscType = "CD-R";
+static int g_defaultSpeed = 4;
+static BurnProgressCallback g_progressCallback = nullptr;
+static void* g_progressUserData = nullptr;
+
+extern "C" {
+
+void SetBurnLastError(const std::string& error) {
+    g_lastError = error;
+}
+
+const char* GetLastErrorMessage() {
+    static thread_local std::string result;
+    result = g_lastError;
+    return result.c_str();
+}
+
+void ClearLastError() {
+    g_lastError.clear();
+}
+
+void FreeStringMemory(void* ptr) {
+    if (ptr) {
+        free(ptr);
+    }
+}
+
+void SetProgressCallback(BurnProgressCallback callback, void* userData) {
+    g_progressCallback = callback;
+    g_progressUserData = userData;
+}
+
+void NotifyProgressBurn(int percent, const char* status) {
+    if (g_progressCallback) {
+        g_progressCallback(percent, status, g_progressUserData);
+    }
+}
+
+int CreateISOToDisc(const char* isoPath, const char* devicePath, const char* discType, int speed) {
+    if (!isoPath || !devicePath) {
+        SetBurnLastError("Invalid parameters");
+        return BURN_ERROR_INVALID_PARAM;
+    }
+    
+    std::unique_ptr<IPlatform> platform = CreatePlatformImpl();
+    if (!platform) {
+        SetBurnLastError("Failed to create platform implementation");
+        return BURN_ERROR_UNSUPPORTED_FORMAT;
+    }
+    
+    std::string disc = discType ? discType : g_defaultDiscType;
+    int burnSpeed = speed > 0 ? speed : g_defaultSpeed;
+    
+    if (platform->BurnISO(isoPath, devicePath, disc, burnSpeed)) {
+        return BURN_SUCCESS;
+    }
+    
+    return BURN_ERROR_BURN_FAILED;
+}
+
+int BurnDirectoryToDisc(const char* sourceDir, const char* devicePath, const char* discType, int speed) {
+    if (!sourceDir || !devicePath) {
+        SetBurnLastError("Invalid parameters");
+        return BURN_ERROR_INVALID_PARAM;
+    }
+    
+    char tempIsoPath[512];
+    const char* tempDir = getenv("TEMP");
+    if (!tempDir) tempDir = getenv("TMP");
+    if (!tempDir) tempDir = ".";
+    snprintf(tempIsoPath, sizeof(tempIsoPath), "%s\\temp_burn_%d.iso", tempDir, rand());
+    
+    if (CreateISOImage(sourceDir, tempIsoPath, "BURN") != BURN_SUCCESS) {
+        SetBurnLastError("Failed to create temporary ISO");
+        return BURN_ERROR_ISO_CREATION_FAILED;
+    }
+    
+    int result = CreateISOToDisc(tempIsoPath, devicePath, discType, speed);
+    
+    remove(tempIsoPath);
+    
+    return result;
+}
+
+int CreateISOImage(const char* sourcePath, const char* isoPath, const char* volumeLabel) {
+    if (!sourcePath || !isoPath) {
+        SetBurnLastError("Invalid parameters");
+        return BURN_ERROR_INVALID_PARAM;
+    }
+    
+    std::unique_ptr<IPlatform> platform = CreatePlatformImpl();
+    if (!platform) {
+        SetBurnLastError("Failed to create platform implementation");
+        return BURN_ERROR_UNSUPPORTED_FORMAT;
+    }
+    
+    std::string label = volumeLabel ? volumeLabel : "DISC";
+    
+    if (platform->CreateISO(sourcePath, isoPath, label)) {
+        return BURN_SUCCESS;
+    }
+    
+    return BURN_ERROR_ISO_CREATION_FAILED;
+}
+
+int VerifyDisc(const char* devicePath, const char* isoPath) {
+    if (!devicePath || !isoPath) {
+        SetBurnLastError("Invalid parameters");
+        return BURN_ERROR_INVALID_PARAM;
+    }
+    return BURN_SUCCESS;
+}
+
+int ListBurningDevices(DeviceInfo** devices, int* deviceCount) {
+    if (!devices || !deviceCount) {
+        SetBurnLastError("Invalid parameters");
+        return BURN_ERROR_INVALID_PARAM;
+    }
+    
+    std::unique_ptr<IPlatform> platform = CreatePlatformImpl();
+    if (!platform) {
+        SetBurnLastError("Failed to create platform implementation");
+        return BURN_ERROR_UNSUPPORTED_FORMAT;
+    }
+    
+    std::vector<DeviceInfo> deviceList = platform->ListDevices();
+    *deviceCount = (int)deviceList.size();
+    
+    if (*deviceCount == 0) {
+        *devices = nullptr;
+        return BURN_SUCCESS;
+    }
+    
+    *devices = (DeviceInfo*)malloc(sizeof(DeviceInfo) * (*deviceCount));
+    for (int i = 0; i < *deviceCount; ++i) {
+        (*devices)[i] = deviceList[i];
+    }
+    
+    return BURN_SUCCESS;
+}
+
+void FreeDeviceList(DeviceInfo* devices, int deviceCount) {
+    if (devices) {
+        free(devices);
+    }
+}
+
+int GetDefaultDevice(char* devicePath, int bufferSize) {
+    if (!devicePath || bufferSize <= 0) {
+        return BURN_ERROR_INVALID_PARAM;
+    }
+    
+    if (g_defaultDevice.empty()) {
+        devicePath[0] = '\0';
+        return BURN_ERROR_DEVICE_NOT_FOUND;
+    }
+    
+    strncpy(devicePath, g_defaultDevice.c_str(), bufferSize - 1);
+    devicePath[bufferSize - 1] = '\0';
+    return BURN_SUCCESS;
+}
+
+const char* GetPlatformInfo() {
+    std::unique_ptr<IPlatform> platform = CreatePlatformImpl();
+    if (!platform) {
+        return "Unknown";
+    }
+    
+    static thread_local std::string result;
+    result = platform->GetPlatformInfo();
+    return result.c_str();
+}
+
+int CheckToolAvailability(const char* toolName) {
+    if (!toolName) {
+        return 0;
+    }
+    
+    std::unique_ptr<IPlatform> platform = CreatePlatformImpl();
+    if (!platform) {
+        return 0;
+    }
+    
+    return platform->CheckToolAvailability(toolName) ? 1 : 0;
+}
+
+const char* GetSupportedFormats() {
+    static const char* formats = "CD-R, CD-RW, DVD-R, DVD+R, DVD-RW, DVD+RW, DVD-RAM, BD-R, BD-RE";
+    return formats;
+}
+
+int ValidateSourcePath(const char* path) {
+    if (!path) {
+        return 0;
+    }
+    FILE* f = fopen(path, "r");
+    if (f) {
+        fclose(f);
+        return 1;
+    }
+    return 1;
+}
+
+void SetDefaultDevice(const char* device) {
+    if (device) {
+        g_defaultDevice = device;
+    }
+}
+
+void SetDefaultDiscType(const char* discType) {
+    if (discType) {
+        g_defaultDiscType = discType;
+    }
+}
+
+void SetDefaultSpeed(int speed) {
+    if (speed > 0) {
+        g_defaultSpeed = speed;
+    }
+}
+
+}
+
+class BurningUtility::Impl {
+public:
+    Impl() {
+        platform = CreatePlatformImpl();
+    }
+    
+    std::unique_ptr<IPlatform> platform;
+};
+
+BurningUtility::BurningUtility() : pImpl(new Impl()) {
+}
+
+BurningUtility::~BurningUtility() {
+    delete pImpl;
+}
+
+bool BurningUtility::CreateISOToDisc(const std::string& isoPath, const std::string& devicePath,
+                                    const std::string& discType, int speed) {
+    return ::CreateISOToDisc(isoPath.c_str(), devicePath.c_str(), discType.c_str(), speed) == BURN_SUCCESS;
+}
+
+bool BurningUtility::BurnDirectoryToDisc(const std::string& sourceDir, const std::string& devicePath,
+                                        const std::string& discType, int speed) {
+    return ::BurnDirectoryToDisc(sourceDir.c_str(), devicePath.c_str(), discType.c_str(), speed) == BURN_SUCCESS;
+}
+
+bool BurningUtility::CreateISOImage(const std::string& sourcePath, const std::string& isoPath,
+                                   const std::string& volumeLabel) {
+    return ::CreateISOImage(sourcePath.c_str(), isoPath.c_str(), volumeLabel.c_str()) == BURN_SUCCESS;
+}
+
+bool BurningUtility::VerifyDisc(const std::string& devicePath, const std::string& isoPath) {
+    return ::VerifyDisc(devicePath.c_str(), isoPath.c_str()) == BURN_SUCCESS;
+}
+
+std::vector<DeviceInfo> BurningUtility::ListBurningDevices() {
+    DeviceInfo* devices = nullptr;
+    int count = 0;
+    std::vector<DeviceInfo> result;
+    
+    if (::ListBurningDevices(&devices, &count) == BURN_SUCCESS && devices) {
+        for (int i = 0; i < count; ++i) {
+            result.push_back(devices[i]);
+        }
+        ::FreeDeviceList(devices, count);
+    }
+    
+    return result;
+}
+
+std::string BurningUtility::GetDefaultDevice() {
+    char buffer[512];
+    if (::GetDefaultDevice(buffer, sizeof(buffer)) == BURN_SUCCESS) {
+        return std::string(buffer);
+    }
+    return "";
+}
+
+std::string BurningUtility::GetPlatformInfo() {
+    const char* info = ::GetPlatformInfo();
+    return info ? std::string(info) : "Unknown";
+}
+
+bool BurningUtility::CheckToolAvailability(const std::string& toolName) {
+    return ::CheckToolAvailability(toolName.c_str()) == 1;
+}
+
+std::string BurningUtility::GetSupportedFormats() {
+    const char* formats = ::GetSupportedFormats();
+    return formats ? std::string(formats) : "";
+}
+
+bool BurningUtility::ValidateSourcePath(const std::string& path) {
+    return ::ValidateSourcePath(path.c_str()) == 1;
+}
+
+void BurningUtility::SetDefaultDevice(const std::string& device) {
+    ::SetDefaultDevice(device.c_str());
+}
+
+void BurningUtility::SetDefaultDiscType(const std::string& discType) {
+    ::SetDefaultDiscType(discType.c_str());
+}
+
+void BurningUtility::SetDefaultSpeed(int speed) {
+    ::SetDefaultSpeed(speed);
+}
+
+void BurningUtility::SetProgressCallback(BurnProgressCallback callback, void* userData) {
+    ::SetProgressCallback(callback, userData);
+}
+
+std::string BurningUtility::GetLastErrorMessage() {
+    const char* msg = ::GetLastErrorMessage();
+    return msg ? std::string(msg) : "";
+}
+
+void BurningUtility::ClearLastError() {
+    ::ClearLastError();
+}
