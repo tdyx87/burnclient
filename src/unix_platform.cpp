@@ -32,10 +32,10 @@ public:
 
     std::vector<DeviceInfo> ListDevices() override {
         std::vector<DeviceInfo> devices;
-        struct burn_drive_info *drive_list = nullptr;
+        struct burn_drive_info **drive_list = nullptr;
         unsigned int drive_count = 0;
 
-        if (burn_drive_scan(&drive_list, &drive_count) <= 0) {
+        if (burn_drive_scan(drive_list, &drive_count) <= 0) {
             SetBurnLastError("No drives found");
             DeviceInfo info = {};
             info.isWritable = 1;
@@ -52,7 +52,7 @@ public:
             info.isWritable = 1;
             info.isEmpty = 1;
             strcpy(info.mediaType, "CD/DVD");
-            snprintf(info.devicePath, sizeof(info.devicePath), "%s", drive_list[i].location);
+            snprintf(info.devicePath, sizeof(info.devicePath), "%s", (*drive_list)[i].location);
             snprintf(info.deviceName, sizeof(info.deviceName), "Optical Drive %u", i);
             devices.push_back(info);
         }
@@ -151,7 +151,7 @@ public:
 
         iso_image_set_volume_id(image, volumeLabel.c_str());
 
-        IsoNode *root = iso_image_get_root(image);
+        IsoDir *root = iso_image_get_root(image);
         ret = iso_tree_add_dir_rec(image, root, sourcePath.c_str());
         if (ret < 0) {
             SetBurnLastError("Failed to add source directory to ISO");
