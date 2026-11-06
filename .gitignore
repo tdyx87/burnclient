@@ -53,3 +53,6 @@ Thumbs.db
 
 # Windows reserved names
 NUL
+
+# WorkBuddy session data / local build harness
+.workbuddy-ai/

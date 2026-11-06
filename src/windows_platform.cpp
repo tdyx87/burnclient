@@ -13,13 +13,47 @@
 #include <imapi2fs.h>
 #include <comdef.h>
 #include <shlobj.h>
+#include <shlwapi.h>   /* SHCreateStreamOnFileA */
+#include <oleauto.h>   /* SAFEARRAY helpers */
 
 #pragma comment(lib, "ole32.lib")
 #pragma comment(lib, "oleaut32.lib")
+#pragma comment(lib, "shlwapi.lib")
 
 /* Internal C++ helpers — NOT extern "C" (they take std::string) */
 void SetBurnLastError(const std::string& error);
 void NotifyProgressBurn(int percent, const char* status);
+
+/* IDiscRecorder2::get_VolumePathNames() returns a SAFEARRAY of BSTR,
+ * NOT a single BSTR. Extract the first volume path as UTF-8. */
+static bool GetFirstVolumePath(IDiscRecorder2* recorder, char* outBuf, size_t outSize) {
+    if (!recorder || !outBuf || outSize == 0) {
+        return false;
+    }
+
+    SAFEARRAY* paths = nullptr;
+    if (FAILED(recorder->get_VolumePathNames(&paths)) || !paths) {
+        return false;
+    }
+
+    bool ok = false;
+    LONG lower = 0;
+    LONG upper = -1;
+    if (SUCCEEDED(SafeArrayGetLBound(paths, 1, &lower)) &&
+        SUCCEEDED(SafeArrayGetUBound(paths, 1, &upper)) && upper >= lower) {
+        BSTR first = nullptr;
+        if (SUCCEEDED(SafeArrayGetElement(paths, &lower, &first)) && first) {
+            WideCharToMultiByte(CP_UTF8, 0, first, -1, outBuf,
+                                static_cast<int>(outSize - 1), nullptr, nullptr);
+            outBuf[outSize - 1] = '\0';
+            SysFreeString(first);
+            ok = true;
+        }
+    }
+
+    SafeArrayDestroy(paths);
+    return ok;
+}
 
 class WindowsPlatform : public IPlatform {
 public:
@@ -67,12 +101,8 @@ public:
                             info.isEmpty = 1;
                             strncpy(info.mediaType, "CD/DVD", sizeof(info.mediaType) - 1);
 
-                            BSTR volPath = nullptr;
-                            pRecorder->get_VolumePathNames(&volPath);
-                            if (volPath) {
-                                WideCharToMultiByte(CP_UTF8, 0, volPath, -1, info.devicePath, 511, nullptr, nullptr);
-                                SysFreeString(volPath);
-                            } else {
+                            if (!GetFirstVolumePath(pRecorder, info.devicePath,
+                                                    sizeof(info.devicePath))) {
                                 strncpy(info.devicePath, "D:", sizeof(info.devicePath) - 1);
                             }
 
@@ -122,12 +152,9 @@ public:
                 if (SUCCEEDED(CoCreateInstance(CLSID_MsftDiscRecorder2, nullptr, CLSCTX_INPROC_SERVER,
                                               IID_IDiscRecorder2, (void**)&pRec))) {
                     if (SUCCEEDED(pRec->InitializeDiscRecorder(uniqueId))) {
-                        BSTR volPath = nullptr;
-                        pRec->get_VolumePathNames(&volPath);
                         char path[512] = "";
-                        if (volPath) {
-                            WideCharToMultiByte(CP_UTF8, 0, volPath, -1, path, 511, nullptr, nullptr);
-                            SysFreeString(volPath);
+                        if (!GetFirstVolumePath(pRec, path, sizeof(path))) {
+                            path[0] = '\0';
                         }
                         if (strcmp(path, devicePath.c_str()) == 0) {
                             /* Exact match — use this recorder */
@@ -154,13 +181,6 @@ public:
 
         NotifyProgressBurn(30, "Preparing disc...");
 
-        if (speed > 0) {
-            /* IMAPI2 write speed is in sectors per second.
-             * CD: 1x = 150 sectors/s, DVD: 1x = ~1385 sectors/s.
-             * Use a reasonable approximation. */
-            pRecorder->put_RequestedWriteSpeed(speed * 1000);
-        }
-
         IDiscFormat2Data* pDataWriter = nullptr;
         hr = CoCreateInstance(CLSID_MsftDiscFormat2Data, nullptr, CLSCTX_INPROC_SERVER,
                               IID_IDiscFormat2Data, (void**)&pDataWriter);
@@ -172,7 +192,17 @@ public:
         }
 
         pDataWriter->put_Recorder(pRecorder);
-        pDataWriter->put_ClientName(L"BurningUtility");
+
+        BSTR clientName = SysAllocString(L"BurningUtility");
+        pDataWriter->put_ClientName(clientName);
+        SysFreeString(clientName);
+
+        if (speed > 0) {
+            /* IDiscFormat2Data has no put_RequestedWriteSpeed (the property
+             * is get-only). Write speed is set with SetWriteSpeed() and is
+             * expressed in sectors per second. */
+            pDataWriter->SetWriteSpeed(speed * 1000, VARIANT_FALSE);
+        }
 
         IStream* pStream = nullptr;
         hr = SHCreateStreamOnFileA(isoPath.c_str(), STGM_READ, &pStream);
@@ -228,7 +258,9 @@ public:
             delete[] wbuf;
         }
 
-        pFsImage->put_FileSystemsToCreate(FsiFileSystemISO9660 | FsiFileSystemJoliet);
+        /* The bitwise OR of two enum values is an int in C++; cast back. */
+        pFsImage->put_FileSystemsToCreate(
+            static_cast<FsiFileSystems>(FsiFileSystemISO9660 | FsiFileSystemJoliet));
 
         /* Correct API: use IFsiDirectoryItem->AddTree to import a directory.
          * put_ImportedDirectoryItems does NOT accept a single path string. */

@@ -29,10 +29,13 @@ set(CMAKE_RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
 set(CMAKE_LIBRARY_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/lib)
 set(CMAKE_ARCHIVE_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/lib)
 
+# Each platform .cpp is internally guarded by preprocessor checks, so all
+# of them are compiled everywhere; exactly one provides CreatePlatformImpl().
 set(SOURCES
     src/burning_utility.cpp
     src/windows_platform.cpp
     src/unix_platform.cpp
+    src/mac_platform.cpp
 )
 
 set(HEADERS
@@ -60,22 +63,20 @@ if(MSVC)
     target_compile_definitions(${PROJECT_NAME} PRIVATE BUILDING_DLL _CRT_SECURE_NO_WARNINGS)
     target_link_libraries(${PROJECT_NAME} PRIVATE wbemuuid ole32 oleaut32 shlwapi)
     # IMAPI2 is part of Windows SDK, no extra lib needed
-elseif(UNIX AND NOT APPLE)
-    target_compile_definitions(${PROJECT_NAME} PRIVATE __linux__)
-    find_package(PkgConfig REQUIRED)
-    pkg_check_modules(LIBBURN REQUIRED libburn-1)
-    pkg_check_modules(LIBISOFS REQUIRED libisofs-1)
-    pkg_check_modules(LIBISOBURN libisoburn)
-    target_include_directories(${PROJECT_NAME} PRIVATE ${LIBBURN_INCLUDE_DIRS} ${LIBISOFS_INCLUDE_DIRS} ${LIBISOBURN_INCLUDE_DIRS})
-    target_link_libraries(${PROJECT_NAME} PRIVATE pthread ${LIBBURN_LIBRARIES} ${LIBISOFS_LIBRARIES} ${LIBISOBURN_LIBRARIES})
 elseif(APPLE)
-    target_compile_definitions(${PROJECT_NAME} PRIVATE __APPLE__)
+    # libburn has no Darwin backend (no os-darwin.h upstream) and Homebrew
+    # ships no libburn/libisoburn formula. mac_platform.cpp uses the native
+    # hdiutil/drutil tools instead, so there are no third-party dependencies.
+    message(STATUS "Configuring for macOS (native hdiutil/drutil backend)")
+elseif(UNIX)
+    # Linux / FreeBSD / Solaris: libburn + libisofs (libisoburn is not used).
+    # __linux__ / __APPLE__ are compiler-predefined; do not redefine them.
+    message(STATUS "Configuring for Unix (libburn/libisofs)")
     find_package(PkgConfig REQUIRED)
     pkg_check_modules(LIBBURN REQUIRED libburn-1)
     pkg_check_modules(LIBISOFS REQUIRED libisofs-1)
-    pkg_check_modules(LIBISOBURN REQUIRED libisoburn-1)
-    target_include_directories(${PROJECT_NAME} PRIVATE ${LIBBURN_INCLUDE_DIRS} ${LIBISOFS_INCLUDE_DIRS} ${LIBISOBURN_INCLUDE_DIRS})
-    target_link_libraries(${PROJECT_NAME} PRIVATE ${LIBBURN_LIBRARIES} ${LIBISOFS_LIBRARIES} ${LIBISOBURN_LIBRARIES})
+    target_include_directories(${PROJECT_NAME} PRIVATE ${LIBBURN_INCLUDE_DIRS} ${LIBISOFS_INCLUDE_DIRS})
+    target_link_libraries(${PROJECT_NAME} PRIVATE pthread ${LIBBURN_LIBRARIES} ${LIBISOFS_LIBRARIES})
 endif()
 
 install(TARGETS ${PROJECT_NAME}

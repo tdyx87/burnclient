@@ -9,11 +9,15 @@ on:
 
 jobs:
   build-windows:
-    runs-on: windows-2019
+    # windows-2019 was retired, which left this job stuck in "queued" forever.
+    runs-on: windows-latest
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
       - name: Configure CMake
-        run: cmake -S . -B build -G "Visual Studio 15 2017" -A Win32
+        # Let CMake pick the installed Visual Studio generator instead of
+        # pinning "Visual Studio 15 2017" (not present on current images).
+        run: cmake -S . -B build
       - name: Build
         run: cmake --build build --config Release
       - name: Test
@@ -22,18 +26,21 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: windows-dll
+          if-no-files-found: ignore
           path: |
-            build/bin/Release/*.dll
-            build/bin/Release/*.exe
+            build/bin/**/*.dll
+            build/bin/**/*.exe
+            build/lib/**/*.dll
 
   build-linux:
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
       - name: Install dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y build-essential cmake libburn-dev libisofs-dev libisoburn-dev
+          sudo apt-get install -y build-essential cmake pkg-config libburn-dev libisofs-dev
       - name: Configure CMake
         run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
       - name: Build
@@ -44,16 +51,24 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: linux-so
+          if-no-files-found: ignore
           path: |
             build/lib/*.so*
             build/bin/*
 
   build-macos:
     runs-on: macos-latest
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
-      - name: Install dependencies
-        run: brew install cmake libburn libisofs libisoburn
+      # No Homebrew packages: libburn has no Darwin backend and Homebrew has
+      # no libburn/libisoburn formula. src/mac_platform.cpp uses the native
+      # hdiutil/drutil tools, so only the Apple toolchain is required.
+      - name: Show toolchain
+        run: |
+          cmake --version
+          command -v hdiutil
+          command -v drutil
       - name: Configure CMake
         run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
       - name: Build

@@ -5,67 +5,111 @@
 #include <cstring>
 #include <cstdlib>
 #include <cstdio>
-#include <unistd.h>
-#include <sys/stat.h>
+#include <stdint.h>   /* libisofs.h needs uint32_t/uint8_t in global scope */
+/* NOTE: POSIX-only headers must stay inside the platform guard below —
+ * this file is also compiled on Windows, where <unistd.h> does not exist. */
 
 /* Internal C++ helpers — NOT extern "C" (they take std::string) */
 void SetBurnLastError(const std::string& error);
 void NotifyProgressBurn(int percent, const char* status);
 
-#ifndef _WIN32
+/* libburn only supports Linux/FreeBSD/Solaris (no Darwin backend).
+ * macOS uses the native hdiutil/drutil backend in mac_platform.cpp. */
+#if !defined(_WIN32) && !defined(__APPLE__)
 
+#include <unistd.h>
+#include <sys/stat.h>
 #include <libburn/libburn.h>
 #include <libisofs/libisofs.h>
 
-/* libburn and libisofs are pure C libraries — no namespace.
+/* IMPORTANT (this was the root cause of the Linux build failures):
  *
- * Key API signatures (verified from libburn/libisofs headers):
+ * libburn.h wraps its ENTIRE API in
+ *     namespace burn { extern "C" { ... } }     (BURN_BEGIN_DECLS)
+ * when included from C++. libisofs.h instead uses a plain
+ *     extern "C" { ... }
+ * and stays in the global namespace, where it also forward-declares
+ * "struct burn_source;".
  *
- * libburn:
- *   int  burn_initialize(void);
- *   void burn_finish(void);
- *   int  burn_drive_scan(struct burn_drive_info *drive_infos[], unsigned int *n_drives);
- *        returns: 0=still scanning, >0=done, <0=error
- *   int  burn_drive_scan_and_grab(struct burn_drive_info *drive_infos[], char *adr, int load);
- *   int  burn_drive_add_whitelist(char *device_address);
- *   void burn_drive_info_free(struct burn_drive_info *drive_infos);
- *   void burn_drive_release(struct burn_drive *drive, int eject);
- *   void burn_drive_set_speed(struct burn_drive *drive, int read_speed, int write_speed);
- *   enum burn_disc_status burn_disc_get_status(struct burn_drive *drive);
- *
- * struct burn_source:
- *   int   (*read)(struct burn_source *, unsigned char *buffer, int size);
- *   off_t (*get_size)(struct burn_source *);
- *   void  (*free_data)(struct burn_source *);
- *   void  burn_source_free(struct burn_source *src);
- *
- * libisofs:
- *   int  iso_init(void);
- *   void iso_finish(void);
- *   int  iso_image_new(const char *name, IsoImage **image);
- *   void iso_image_unref(IsoImage *image);
- *   int  iso_image_create_burn_source(IsoImage *image, IsoWriteOpts *opts,
- *                                     struct burn_source **burn_src);
+ * Consequences for C++ consumers:
+ *  1. Every libburn function/enum/struct must be visible through
+ *     "using namespace burn;".
+ *  2. An unqualified "struct burn_source" is AMBIGUOUS between
+ *     burn::burn_source (full definition) and ::burn_source
+ *     (libisofs forward declaration). Always qualify it explicitly.
+ *  3. iso_image_create_burn_source() takes ::burn_source**, while
+ *     burn_file_source_new()/burn_track_set_source()/burn_source_free()
+ *     use burn::burn_source*. Both describe the same C layout, so a
+ *     reinterpret_cast is used at that one boundary.
  */
+/* Key API signatures (verified against upstream libburn.h / libisofs.h):
+ *
+ *   int  burn_drive_scan(struct burn_drive_info *[], unsigned int *);
+ *   int  burn_drive_scan_and_grab(struct burn_drive_info *[], char *adr, int load);
+ *   int  burn_drive_add_whitelist(char *device_address);   <-- NOT const
+ *   void burn_disc_write(struct burn_write_opts *, struct burn_disc *);
+ *   enum burn_write_types burn_write_opts_auto_write_type(..., char reasons[], int);
+ *   int  iso_image_create_burn_source(IsoImage *, IsoWriteOpts *,
+ *                                     struct burn_source **);
+ *
+ * struct burn_source has .read/.get_size/.free_data/.version/.read_xt/.cancel
+ * struct burn_progress has .sectors (total) and .sector (current).
+ */
+
+using namespace burn;
+
+namespace {
+
+DeviceInfo MakeFallbackDevice() {
+    DeviceInfo info = {};
+    info.isWritable = 1;
+    info.isEmpty = 1;
+    strncpy(info.mediaType, "CD/DVD", sizeof(info.mediaType) - 1);
+    strncpy(info.devicePath, "/dev/sr0", sizeof(info.devicePath) - 1);
+    strncpy(info.deviceName, "Default Optical Drive", sizeof(info.deviceName) - 1);
+    return info;
+}
+
+} /* namespace */
 
 class UnixPlatform : public IPlatform {
 public:
     UnixPlatform() {
-        if (!burn_initialize()) {
+        /* burn_initialize() returns 1 on success; iso_init() returns >= 0.
+         * CI machines / containers usually have no optical drives and may
+         * not permit libburn to initialize — never call into the library
+         * when it failed to start. */
+        burnReady_ = (burn_initialize() != 0);
+        if (!burnReady_) {
             SetBurnLastError("Failed to initialize libburn");
         }
-        if (iso_init() < 0) {
+        isoReady_ = (iso_init() >= 0);
+        if (!isoReady_) {
             SetBurnLastError("Failed to initialize libisofs");
         }
     }
 
     ~UnixPlatform() override {
-        iso_finish();
-        burn_finish();
+        if (isoReady_) {
+            iso_finish();
+        }
+        if (burnReady_) {
+            burn_finish();
+        }
     }
 
+private:
+    bool burnReady_ = false;
+    bool isoReady_ = false;
+
+public:
     std::vector<DeviceInfo> ListDevices() override {
         std::vector<DeviceInfo> devices;
+
+        if (!burnReady_) {
+            devices.push_back(MakeFallbackDevice());
+            return devices;
+        }
 
         struct burn_drive_info *drive_list = nullptr;
         unsigned int drive_count = 0;
@@ -83,13 +127,7 @@ public:
                 burn_drive_info_free(drive_list);
             }
             /* Provide a sensible fallback so callers still get a device path */
-            DeviceInfo info = {};
-            info.isWritable = 1;
-            info.isEmpty = 1;
-            strncpy(info.mediaType, "CD/DVD", sizeof(info.mediaType) - 1);
-            strncpy(info.devicePath, "/dev/sr0", sizeof(info.devicePath) - 1);
-            strncpy(info.deviceName, "Default Optical Drive", sizeof(info.deviceName) - 1);
-            devices.push_back(info);
+            devices.push_back(MakeFallbackDevice());
             return devices;
         }
 
@@ -119,16 +157,25 @@ public:
 
     bool BurnISO(const std::string& isoPath, const std::string& devicePath,
                  const std::string& discType, int speed) override {
+        if (!burnReady_) {
+            SetBurnLastError("libburn is not initialized");
+            return false;
+        }
         NotifyProgressBurn(10, "Initializing burn process...");
 
         /* burn_drive_scan_and_grab takes struct burn_drive_info *drive_infos[],
          * which is a pointer-to-pointer: struct burn_drive_info** */
         struct burn_drive_info *drive_info = nullptr;
 
-        /* Add to whitelist first (optional but recommended) */
-        burn_drive_add_whitelist(devicePath.c_str());
+        /* burn_drive_scan_and_grab() takes char* (NOT const char*), so keep
+         * a mutable NUL-terminated copy. Note: it calls
+         * burn_drive_clear_whitelist() + burn_drive_add_whitelist(adr)
+         * internally, so calling burn_drive_add_whitelist() here is
+         * redundant — that is why the whitelist call was removed. */
+        std::vector<char> deviceAdr(devicePath.begin(), devicePath.end());
+        deviceAdr.push_back('\0');
 
-        if (burn_drive_scan_and_grab(&drive_info, const_cast<char*>(devicePath.c_str()), 0) <= 0) {
+        if (burn_drive_scan_and_grab(&drive_info, deviceAdr.data(), 0) <= 0) {
             SetBurnLastError("Failed to open device: " + devicePath);
             return false;
         }
@@ -156,7 +203,8 @@ public:
         struct burn_session *session = burn_session_create();
         burn_disc_add_session(disc, session, BURN_POS_END);
 
-        struct burn_source *src = burn_file_source_new(isoPath.c_str(), NULL);
+        /* Qualified: unqualified burn_source is ambiguous in C++ */
+        burn::burn_source *src = burn_file_source_new(isoPath.c_str(), NULL);
         if (!src) {
             SetBurnLastError("Failed to create burn source from ISO");
             burn_session_free(session);
@@ -236,6 +284,10 @@ public:
 
     bool CreateISO(const std::string& sourcePath, const std::string& isoPath,
                    const std::string& volumeLabel) override {
+        if (!isoReady_) {
+            SetBurnLastError("libisofs is not initialized");
+            return false;
+        }
         NotifyProgressBurn(10, "Creating ISO image...");
 
         IsoImage *image = nullptr;
@@ -277,12 +329,13 @@ public:
             return false;
         }
 
-        /* iso_image_create_burn_source returns a struct burn_source*.
-         * The third parameter is struct burn_source** (NOT IsoBurnSource**).
-         * IsoBurnSource does not exist in libisofs — it is a libisoburn type. */
-        struct burn_source *burn_src = nullptr;
-        ret = iso_image_create_burn_source(image, opts, &burn_src);
-        if (ret < 0 || !burn_src) {
+        /* iso_image_create_burn_source() is declared in the global namespace
+         * and takes ::burn_source** (libisofs.h forward declaration).
+         * libburn's full struct is burn::burn_source. Both describe the
+         * exact same C layout, so cast once at this boundary. */
+        ::burn_source *iso_src = nullptr;
+        ret = iso_image_create_burn_source(image, opts, &iso_src);
+        if (ret < 0 || !iso_src) {
             SetBurnLastError("Failed to create burn source");
             iso_write_opts_free(opts);
             iso_image_unref(image);
@@ -290,10 +343,14 @@ public:
             return false;
         }
 
-        /* struct burn_source fields:
+        burn::burn_source *burn_src =
+            reinterpret_cast<burn::burn_source *>(iso_src);
+
+        /* burn_source fields:
          *   int   (*read)(struct burn_source *, unsigned char *buffer, int size);
          *   off_t (*get_size)(struct burn_source *);
          *   void  (*free_data)(struct burn_source *);
+         *   int   version; int (*read_xt)(...); int (*cancel)(...);
          * There is NO .size field — must call get_size().
          * There is NO .free field — must call burn_source_free(). */
         off_t total = 0;
@@ -356,4 +413,4 @@ std::unique_ptr<IPlatform> CreatePlatformImpl() {
     return std::make_unique<UnixPlatform>();
 }
 
-#endif /* _WIN32 */
+#endif /* !_WIN32 && !__APPLE__ */

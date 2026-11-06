@@ -24,12 +24,13 @@ static thread_local int g_defaultSpeed = 4;
 static thread_local BurnProgressCallback g_progressCallback = nullptr;
 static thread_local void* g_progressUserData = nullptr;
 
-/* Helper to get a platform instance (may return null) */
-static std::unique_ptr<IPlatform>& GetPlatformRef() {
-    static thread_local std::unique_ptr<IPlatform> s_instance;
-    if (!s_instance) {
-        s_instance = CreatePlatformImpl();
-    }
+/* One platform instance per thread (COM apartments and libburn are both
+ * thread-affine). The pointer is deliberately never destroyed: running
+ * ~IPlatform from a thread_local destructor during CRT/DLL teardown would
+ * call CoUninitialize() / burn_finish() from DLL_PROCESS_DETACH, after those
+ * subsystems may already be gone. The OS reclaims one object per thread. */
+static IPlatform* GetPlatform() {
+    static thread_local IPlatform* s_instance = CreatePlatformImpl().release();
     return s_instance;
 }
 
@@ -122,7 +123,7 @@ int CreateISOToDisc(const char* isoPath, const char* devicePath, const char* dis
         return BURN_ERROR_INVALID_PARAM;
     }
 
-    auto& platform = GetPlatformRef();
+    IPlatform* platform = GetPlatform();
     if (!platform) {
         SetBurnLastError("Failed to create platform implementation");
         return BURN_ERROR_UNSUPPORTED_FORMAT;
@@ -176,7 +177,7 @@ int CreateISOImage(const char* sourcePath, const char* isoPath, const char* volu
         return BURN_ERROR_INVALID_PARAM;
     }
 
-    auto& platform = GetPlatformRef();
+    IPlatform* platform = GetPlatform();
     if (!platform) {
         SetBurnLastError("Failed to create platform implementation");
         return BURN_ERROR_UNSUPPORTED_FORMAT;
@@ -237,7 +238,7 @@ int ListBurningDevices(DeviceInfo** devices, int* deviceCount) {
         return BURN_ERROR_INVALID_PARAM;
     }
 
-    auto& platform = GetPlatformRef();
+    IPlatform* platform = GetPlatform();
     if (!platform) {
         SetBurnLastError("Failed to create platform implementation");
         return BURN_ERROR_UNSUPPORTED_FORMAT;
@@ -285,7 +286,7 @@ int GetDefaultDevice(char* devicePath, int bufferSize) {
 }
 
 const char* GetPlatformInfo() {
-    auto& platform = GetPlatformRef();
+    IPlatform* platform = GetPlatform();
     if (!platform) {
         return "Unknown";
     }
@@ -300,7 +301,7 @@ int CheckToolAvailability(const char* toolName) {
         return 0;
     }
 
-    auto& platform = GetPlatformRef();
+    IPlatform* platform = GetPlatform();
     if (!platform) {
         return 0;
     }
@@ -345,13 +346,13 @@ void SetDefaultSpeed(int speed) {
 /* ---------------------------------------------------------------------------
  * C++ wrapper class (BurningUtility)
  * ------------------------------------------------------------------------- */
+/* The wrapper delegates to the C API, which owns the per-thread platform
+ * instance. Impl is kept as an opaque pImpl so the DLL ABI stays stable.
+ * Creating a second platform here used to double-initialize COM and caused
+ * a crash at process exit. */
 class BurningUtility::Impl {
 public:
-    Impl() {
-        platform = CreatePlatformImpl();
-    }
-
-    std::unique_ptr<IPlatform> platform;
+    Impl() = default;
 };
 
 BurningUtility::BurningUtility() : pImpl(new Impl()) {
