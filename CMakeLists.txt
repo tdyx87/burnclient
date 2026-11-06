@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.10)
-project(BurningDLL VERSION 1.0.0 LANGUAGES C CXX)
+project(BurningDLL VERSION 1.0.1 LANGUAGES C CXX)
 
 set(PROJECT_NAME "BurningDLL")
 set(PROJECT_DESCRIPTION "Cross-platform burning utility DLL for Visual Studio 2017")
@@ -67,7 +67,19 @@ target_include_directories(${PROJECT_NAME} PUBLIC
 if(MSVC)
     target_compile_definitions(${PROJECT_NAME} PRIVATE BUILDING_DLL _CRT_SECURE_NO_WARNINGS)
     target_link_libraries(${PROJECT_NAME} PRIVATE wbemuuid ole32 oleaut32 shlwapi)
-    # IMAPI2 is part of Windows SDK, no extra lib needed
+    # IMAPI2 is part of Windows SDK, no extra lib needed.
+
+    # The DLL is built with the dynamic CRT (/MD), so MSVCP140.dll,
+    # VCRUNTIME140.dll and friends are real runtime dependencies. Bundle the
+    # redistributable ones into bin/ so a clean machine can run the SDK.
+    # UCRT (api-ms-win-crt-*.dll) and IMAPI2/COM are OS components and are
+    # deliberately NOT redistributed.
+    set(CMAKE_INSTALL_SYSTEM_RUNTIME_LIBS_SKIP TRUE)
+    include(InstallRequiredSystemLibraries)
+    if(CMAKE_INSTALL_SYSTEM_RUNTIME_LIBS)
+        install(FILES ${CMAKE_INSTALL_SYSTEM_RUNTIME_LIBS} DESTINATION bin)
+        message(STATUS "Bundling MSVC runtimes: ${CMAKE_INSTALL_SYSTEM_RUNTIME_LIBS}")
+    endif()
 elseif(APPLE)
     # libburn has no Darwin backend (no os-darwin.h upstream) and Homebrew
     # ships no libburn/libisoburn formula. mac_platform.cpp uses the native
@@ -82,6 +94,18 @@ elseif(UNIX)
     pkg_check_modules(LIBISOFS REQUIRED libisofs-1)
     target_include_directories(${PROJECT_NAME} PRIVATE ${LIBBURN_INCLUDE_DIRS} ${LIBISOFS_INCLUDE_DIRS})
     target_link_libraries(${PROJECT_NAME} PRIVATE pthread ${LIBBURN_LIBRARIES} ${LIBISOFS_LIBRARIES})
+endif()
+
+# The installed shared library lives in lib/ while the CLI lives in bin/.
+# Without an INSTALL_RPATH, CMake strips the build-tree RPATH on install and
+# burn_cli can no longer find libburning_dll.so. $ORIGIN on the library also
+# lets it find the bundled libburn/libisofs .so files in the same directory.
+if(APPLE)
+    set_target_properties(${PROJECT_NAME} PROPERTIES INSTALL_RPATH "@loader_path")
+    set(BURN_EXE_INSTALL_RPATH "@loader_path/../lib")
+elseif(UNIX)
+    set_target_properties(${PROJECT_NAME} PROPERTIES INSTALL_RPATH "$ORIGIN")
+    set(BURN_EXE_INSTALL_RPATH "$ORIGIN/../lib")
 endif()
 
 install(TARGETS ${PROJECT_NAME}
@@ -111,6 +135,9 @@ add_subdirectory(tests)
 add_executable(burn_cli examples/burn_cli.cpp)
 target_link_libraries(burn_cli PRIVATE ${PROJECT_NAME})
 target_include_directories(burn_cli PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+if(BURN_EXE_INSTALL_RPATH)
+    set_target_properties(burn_cli PROPERTIES INSTALL_RPATH "${BURN_EXE_INSTALL_RPATH}")
+endif()
 
 # Build the plain-C samples too. This is a compile-time guard that the public
 # header really is consumable from C (no unguarded C++ headers / types).
@@ -158,3 +185,10 @@ message(STATUS "Compiler: ${CMAKE_CXX_COMPILER_ID}")
 message(STATUS "Build Type: ${CMAKE_BUILD_TYPE}")
 message(STATUS "Generator: ${CMAKE_GENERATOR}")
 message(STATUS "========================================")
+
+# Runs LAST so every installed file is already on disk. On Linux/macOS it
+# resolves and bundles third-party .so/.dylib files into lib/; on every
+# platform it writes DEPENDENCIES.txt describing what is (and is not) shipped.
+# Windows CRT DLLs are installed above by InstallRequiredSystemLibraries.
+install(CODE "set(BUNDLE_SYSTEM \"${CMAKE_SYSTEM_NAME}\")")
+install(SCRIPT ${CMAKE_CURRENT_SOURCE_DIR}/packaging/bundle_runtime_deps.cmake)

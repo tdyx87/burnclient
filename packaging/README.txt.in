@@ -9,15 +9,26 @@ Contents
 --------
   bin/       burning_dll.dll | libburning_dll.so* | libburning_dll*.dylib
              burn_cli              command-line example, needs the shared lib
+             MSVCP140.dll, VCRUNTIME140.dll, ...   (Windows VC++ runtimes)
   lib/       burning_dll.lib       Windows import library only
+             libburn.so.*, libisofs.so.*, ...      (Linux runtime deps)
   include/   burning_utility.h     public C API + C++ wrappers
   examples/  c_example.c, cpp_example.cpp, csharp_example.cs, job_example.c
+  DEPENDENCIES.txt   exact list of bundled / excluded runtime libraries
+  README.txt         this file
+
+This package is SELF-CONTAINED: all third-party shared libraries the DLL
+needs are shipped next to it. Keep bin/ and lib/ together when copying.
 
 Using the library
 -----------------
   Add include/ to your include path, link against lib/ on Windows, and keep
   the shared library next to your executable (or on the system library path)
-  at runtime. Run "burn_cli" with no arguments for the available commands.
+  at runtime. On Linux/macOS give your executable an RPATH of
+  $ORIGIN/../lib (or @loader_path/../lib) just like burn_cli does - the
+  bundled lib/ directory is found relative to the library itself, so no
+  LD_LIBRARY_PATH and no extra apt/brew packages are needed.
+  Run "burn_cli" with no arguments for the available commands.
 
 Asynchronous jobs (recommended)
 -------------------------------
@@ -55,10 +66,20 @@ Asynchronous jobs (recommended)
 
 Runtime dependencies
 --------------------
-  Windows : IMAPI2 ships with Windows, nothing extra to distribute.
-  Linux   : libburn + libisofs runtime packages must be installed on the
-            target (Debian/Ubuntu: libburn4 / libisofs6 or equivalents).
-  macOS   : uses the built-in hdiutil / drutil tools; no third-party runtime.
+  Windows : the redistributable MSVC CRT (MSVCP140.dll, VCRUNTIME140.dll,
+            MSVCP140_1/2.dll, concrt140.dll) is bundled in bin/. IMAPI2,
+            COM and the Universal CRT (api-ms-win-crt-*.dll) are Windows OS
+            components and are intentionally NOT redistributed.
+  Linux   : libburn / libisofs and their non-system transitive .so files are
+            bundled in lib/ and found through a relative $ORIGIN RPATH.
+            glibc, the loader and libstdc++ stay on the host system.
+  macOS   : backend uses built-in hdiutil / drutil tools; any non-system
+            dylib would be bundled in lib/ (see DEPENDENCIES.txt).
+
+  DEPENDENCIES.txt lists exactly what was bundled, where each file came
+  from, and which system libraries were deliberately left on the host.
+  Linux packages are built against the CI runner's distro libraries; use
+  the whole lib/ directory as one unit.
 
   A real optical drive is required for burning; listing devices works
   without media.

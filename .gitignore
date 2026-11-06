@@ -5,6 +5,7 @@ cmake-build-*/
 
 # Packaging / downloadable SDK staging
 dist/
+dist_*/
 release/
 release-assets/
 
