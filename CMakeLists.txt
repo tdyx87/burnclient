@@ -174,6 +174,13 @@ set_tests_properties(job_example_selftest PROPERTIES TIMEOUT 30 LABELS "job")
 add_test(NAME job_example_cancel COMMAND job_example cancel)
 set_tests_properties(job_example_cancel PROPERTIES TIMEOUT 30 LABELS "job")
 
+# Hardware integration test: burns a generated ISO to the first writable
+# recorder. Self-skips (exit 0) when no writable burner exists, so CI stays
+# green; on machines with a real or virtual burner it runs a full
+# create-image + async-burn + status-machine pass against the hardware.
+add_test(NAME burn_integration COMMAND burn_cli burn-test)
+set_tests_properties(burn_integration PROPERTIES TIMEOUT 300 LABELS "integration")
+
 if(NOT CMAKE_BUILD_TYPE)
     set(CMAKE_BUILD_TYPE "Release" CACHE STRING "Build type" FORCE)
 endif()

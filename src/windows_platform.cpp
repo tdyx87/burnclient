@@ -11,6 +11,7 @@
 #ifdef _WIN32
 
 #include <windows.h>
+#include <winioctl.h>  /* IOCTL_DISK_IS_WRITABLE */
 #include <imapi2.h>
 #include <imapi2fs.h>
 #include <comdef.h>
@@ -169,6 +170,58 @@ static void WindowsCancelHook(void* context) {
     }
 }
 
+static std::string HrToHex(HRESULT hr) {
+    char buf[16];
+    snprintf(buf, sizeof(buf), "%08lX", (unsigned long)hr);
+    return std::string(buf);
+}
+
+/* Probe writability through a read-only handle. Some virtual recorders
+ * (e.g. KernSafe in read-only mode) mark their device write-protected at
+ * the driver level; IMAPI2 then fails InitializeDiscRecorder with
+ * E_ACCESSDENIED and there is no way to burn. Knowing this up front lets
+ * callers skip cleanly instead of dying deep inside IMAPI2. */
+static bool ProbeDeviceWritable(const wchar_t* deviceInterface) {
+    HANDLE h = CreateFileW(deviceInterface, GENERIC_READ,
+                           FILE_SHARE_READ | FILE_SHARE_WRITE,
+                           nullptr, OPEN_EXISTING, 0, nullptr);
+    if (h == INVALID_HANDLE_VALUE) {
+        return false;
+    }
+    DWORD bytes = 0;
+    BOOL writable = DeviceIoControl(h, IOCTL_DISK_IS_WRITABLE, nullptr, 0,
+                                    nullptr, 0, &bytes, nullptr);
+    CloseHandle(h);
+    return writable != FALSE;
+}
+
+/* Fallback device identity when InitializeDiscRecorder fails: walk the
+ * drive letters and claim an unclaimed DRIVE_CDROM letter. With one
+ * optical device this resolves exactly; with several it is a best effort
+ * and the device is additionally flagged not-writable when probing says
+ * so. */
+static bool FindUnclaimedCdromLetter(std::vector<std::string>& claimed,
+                                     char* out, size_t outSize) {
+    for (char letter = 'A'; letter <= 'Z'; ++letter) {
+        char root[4] = { letter, ':', '\\', '\0' };
+        if (GetDriveTypeA(root) != DRIVE_CDROM) {
+            continue;
+        }
+        std::string path = std::string(1, letter) + ":";
+        bool taken = false;
+        for (size_t i = 0; i < claimed.size(); ++i) {
+            if (claimed[i] == path) { taken = true; break; }
+        }
+        if (taken) continue;
+        strncpy(out, path.c_str(), outSize - 1);
+        out[outSize - 1] = '\0';
+        claimed.push_back(path);
+        return true;
+    }
+    if (outSize > 0) out[0] = '\0';
+    return false;
+}
+
 class WindowsPlatform : public IPlatform {
 public:
     WindowsPlatform() {
@@ -181,19 +234,19 @@ public:
 
     std::vector<DeviceInfo> ListDevices() override {
         std::vector<DeviceInfo> devices;
+        std::vector<std::string> claimedPaths;
 
         IDiscMaster2* pDiscMaster = nullptr;
         HRESULT hr = CoCreateInstance(CLSID_MsftDiscMaster2, nullptr, CLSCTX_INPROC_SERVER,
                                       IID_IDiscMaster2, (void**)&pDiscMaster);
         if (FAILED(hr)) {
-            SetBurnLastError("Failed to create IDiscMaster2");
-            DeviceInfo info = {};
-            info.isWritable = 1;
-            info.isEmpty = 1;
-            strncpy(info.mediaType, "CD/DVD", sizeof(info.mediaType) - 1);
-            strncpy(info.devicePath, "D:", sizeof(info.devicePath) - 1);
-            strncpy(info.deviceName, "Default Optical Drive", sizeof(info.deviceName) - 1);
-            devices.push_back(info);
+            /* Report honestly: no fabricated fallback devices. Callers and
+             * automated tests must see an empty list, not a phantom "D:". */
+            char msg[128];
+            snprintf(msg, sizeof(msg),
+                     "Failed to create IDiscMaster2 (HRESULT 0x%08lX)",
+                     (unsigned long)hr);
+            SetBurnLastError(msg);
             return devices;
         }
 
@@ -217,7 +270,10 @@ public:
 
                             if (!GetFirstVolumePath(pRecorder, info.devicePath,
                                                     sizeof(info.devicePath))) {
-                                strncpy(info.devicePath, "D:", sizeof(info.devicePath) - 1);
+                                FindUnclaimedCdromLetter(claimedPaths, info.devicePath,
+                                                         sizeof(info.devicePath));
+                            } else {
+                                claimedPaths.push_back(info.devicePath);
                             }
 
                             BSTR prodId = nullptr;
@@ -229,6 +285,28 @@ public:
                                 strncpy(info.deviceName, "Optical Drive", sizeof(info.deviceName) - 1);
                             }
 
+                            devices.push_back(info);
+                        } else {
+                            /* Recorder enumerated but cannot be opened
+                             * exclusively (write-protected driver, media
+                             * locked by another process, or missing
+                             * privileges). Keep it visible with an honest
+                             * writability flag so tests can SKIP with a
+                             * precise reason instead of "device not found". */
+                            DeviceInfo info = {};
+                            wchar_t* devIf = reinterpret_cast<wchar_t*>(uniqueId);
+                            info.isWritable =
+                                ProbeDeviceWritable(devIf) ? 1 : 0;
+                            info.isEmpty = 1;
+                            strncpy(info.mediaType, "CD/DVD", sizeof(info.mediaType) - 1);
+                            if (!FindUnclaimedCdromLetter(claimedPaths, info.devicePath,
+                                                          sizeof(info.devicePath))) {
+                                strncpy(info.devicePath, "?", sizeof(info.devicePath) - 1);
+                            }
+                            snprintf(info.deviceName, sizeof(info.deviceName),
+                                     "Optical drive (recorder init failed, "
+                                     "HRESULT 0x%08lX)",
+                                     (unsigned long)hr);
                             devices.push_back(info);
                         }
                         pRecorder->Release();
@@ -263,6 +341,7 @@ public:
         IDiscRecorder2* pRecorder = nullptr;
         long count = 0;
         pDiscMaster->get_Count(&count);
+        HRESULT lastInitFailure = S_OK;
         for (long i = 0; i < count; ++i) {
             BSTR uniqueId = nullptr;
             pDiscMaster->get_Item(i, &uniqueId);
@@ -270,7 +349,8 @@ public:
                 IDiscRecorder2* pRec = nullptr;
                 if (SUCCEEDED(CoCreateInstance(CLSID_MsftDiscRecorder2, nullptr, CLSCTX_INPROC_SERVER,
                                               IID_IDiscRecorder2, (void**)&pRec))) {
-                    if (SUCCEEDED(pRec->InitializeDiscRecorder(uniqueId))) {
+                    HRESULT initHr = pRec->InitializeDiscRecorder(uniqueId);
+                    if (SUCCEEDED(initHr)) {
                         char path[512] = "";
                         if (!GetFirstVolumePath(pRec, path, sizeof(path))) {
                             path[0] = '\0';
@@ -282,6 +362,7 @@ public:
                             pRec->Release();
                         }
                     } else {
+                        lastInitFailure = initHr;
                         pRec->Release();
                     }
                 }
@@ -290,7 +371,15 @@ public:
         }
 
         if (!pRecorder) {
-            SetBurnLastError("Device not found: " + devicePath);
+            if (FAILED(lastInitFailure)) {
+                SetBurnLastError(
+                    "Recorder present but cannot be opened exclusively "
+                    "(HRESULT 0x" + HrToHex(lastInitFailure) +
+                    "). The device may be write-protected by its driver, "
+                    "busy, or locked by another process.");
+            } else {
+                SetBurnLastError("Device not found: " + devicePath);
+            }
             pDiscMaster->Release();
             return false;
         }
