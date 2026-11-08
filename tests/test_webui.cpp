@@ -195,6 +195,177 @@ int main(int argc, char** argv) {
     CHECK(!Contains(page, "F:\\\\"));
     std::printf("  page length: %zu bytes\n", page.size());
 
+    /* ---- the page's script must be syntactically valid ----
+     * A syntax error in the embedded script stops the whole block from
+     * running, which leaves the device list and the capability chips empty
+     * while every API call still works. That failure is invisible to the
+     * HTTP level checks, so the script is checked here.
+     *
+     * The check is structural rather than a full JavaScript parser: it
+     * verifies that the parts which are easy to break while embedding the
+     * script in a C string literal are intact. */
+    {
+        const size_t scriptStart = page.find("<script>");
+        const size_t scriptEnd = page.find("</script>");
+        CHECK(scriptStart != std::string::npos);
+        CHECK(scriptEnd != std::string::npos);
+        if (scriptStart != std::string::npos && scriptEnd != std::string::npos) {
+            const std::string script = page.substr(scriptStart + 8,
+                                                     scriptEnd - scriptStart - 8);
+            std::printf("  script length: %zu bytes\n", script.size());
+
+            /* Balanced braces and parentheses: an unbalanced pair is the
+             * usual result of a mangled escape. Comments and string
+             * literals are skipped, so a bracket inside them does not
+             * count. */
+            int braces = 0, parens = 0;
+            {
+                bool inS = false, inT = false, inLC = false, inBC = false;
+                char q = 0;
+                for (size_t i = 0; i < script.size(); ++i) {
+                    const char c = script[i];
+                    const char next = (i + 1 < script.size()) ? script[i + 1] : '\0';
+                    if (inLC) { if (c == '\n') inLC = false; continue; }
+                    if (inBC) { if (c == '*' && next == '/') { inBC = false; ++i; } continue; }
+                    if (inT) {
+                        if (c == '\\') { ++i; continue; }
+                        if (c == '`') inT = false;
+                        continue;
+                    }
+                    if (inS) {
+                        if (c == '\\') { ++i; continue; }
+                        if (c == q) inS = false;
+                        continue;
+                    }
+                    if (c == '/' && next == '/') { inLC = true; ++i; continue; }
+                    if (c == '/' && next == '*') { inBC = true; ++i; continue; }
+                    if (c == '`') { inT = true; continue; }
+                    if (c == '\'' || c == '"') { inS = true; q = c; continue; }
+                    if (c == '{') ++braces;
+                    else if (c == '}') --braces;
+                    else if (c == '(') ++parens;
+                    else if (c == ')') --parens;
+                }
+            }
+            CHECK(braces == 0);
+            CHECK(parens == 0);
+            std::printf("  braces=%d parens=%d\n", braces, parens);
+
+            /* A literal newline inside a string literal breaks the script.
+             * This is what a wrongly escaped \\n in the C++ source produces:
+             * the byte pair backslash+n is fine, a raw newline is not.
+             *
+             * Comments are skipped: an apostrophe inside a comment (as in
+             * "the backend's capability") is not a string delimiter. Template
+             * literals may legitimately span lines, so they are tracked
+             * separately. */
+            bool inString = false;
+            bool inTemplate = false;
+            bool inLineComment = false;
+            bool inBlockComment = false;
+            bool rawNewlineInString = false;
+            char quote = 0;
+            for (size_t i = 0; i < script.size(); ++i) {
+                const char c = script[i];
+                const char next = (i + 1 < script.size()) ? script[i + 1] : '\0';
+
+                if (inLineComment) {
+                    if (c == '\n') inLineComment = false;
+                    continue;
+                }
+                if (inBlockComment) {
+                    if (c == '*' && next == '/') { inBlockComment = false; ++i; }
+                    continue;
+                }
+                if (inTemplate) {
+                    if (c == '\\') { ++i; continue; }
+                    if (c == '`') inTemplate = false;
+                    continue;
+                }
+                if (inString) {
+                    if (c == '\\') { ++i; continue; }   /* skip the escaped one */
+                    if (c == quote) { inString = false; continue; }
+                    if (c == '\n') { rawNewlineInString = true; break; }
+                    continue;
+                }
+                /* Not inside a string: look for a comment start. */
+                if (c == '/' && next == '/') { inLineComment = true; ++i; continue; }
+                if (c == '/' && next == '*') { inBlockComment = true; ++i; continue; }
+                if (c == '`') {
+                    inTemplate = true;
+                } else if (c == '\'' || c == '"') {
+                    inString = true;
+                    quote = c;
+                }
+            }
+            CHECK(!rawNewlineInString);
+            if (rawNewlineInString) {
+                std::printf("  a raw newline sits inside a string literal: "
+                            "the script cannot parse\n");
+            }
+
+            /* A backslash outside any string is a syntax error in
+             * JavaScript: the escape sequences only exist inside
+             * literals. This is the shape a wrongly escaped \\n in the
+             * C++ source takes - it lands in the script as a bare token
+             * such as "value += (\n ? ...)" - and it stops the whole
+             * script block from running.
+             *
+             * Regular expression literals are skipped: a backslash
+             * inside /\.wav$/ is perfectly valid. */
+            {
+                bool inS = false, inT = false, inLC = false, inBC = false, inRe = false;
+                char q = 0;
+                bool strayBackslash = false;
+                int strayAt = -1;
+                for (size_t i = 0; i < script.size(); ++i) {
+                    const char c = script[i];
+                    const char next = (i + 1 < script.size()) ? script[i + 1] : '\0';
+                    if (inLC) { if (c == '\n') inLC = false; continue; }
+                    if (inBC) { if (c == '*' && next == '/') { inBC = false; ++i; } continue; }
+                    if (inT) {
+                        if (c == '\\') { ++i; continue; }
+                        if (c == '`') inT = false;
+                        continue;
+                    }
+                    if (inRe) {
+                        if (c == '\\') { ++i; continue; }
+                        if (c == '[') { /* character class: ] does not end it */ }
+                        else if (c == '/') { inRe = false; }
+                        continue;
+                    }
+                    if (inS) {
+                        if (c == '\\') { ++i; continue; }
+                        if (c == q) inS = false;
+                        continue;
+                    }
+                    if (c == '/' && next == '/') { inLC = true; ++i; continue; }
+                    if (c == '/' && next == '*') { inBC = true; ++i; continue; }
+                    if (c == '`') { inT = true; continue; }
+                    if (c == '\'' || c == '"') { inS = true; q = c; continue; }
+                    /* A slash starts a regular expression when the previous
+                     * significant token cannot end an expression; the
+                     * script only uses /.../ right after "(" or "," or "=",
+                     * so the simple rule below is enough here. */
+                    if (c == '/') { inRe = true; continue; }
+                    if (c == '\\') { strayBackslash = true; strayAt = (int)i; break; }
+                }
+                CHECK(!strayBackslash);
+                if (strayBackslash) {
+                    const size_t from = (size_t)strayAt > 40 ? (size_t)strayAt - 40 : 0;
+                    std::printf("  a backslash outside a string at %d: %s\n", strayAt,
+                                script.substr(from, 90).c_str());
+                }
+            }
+
+            /* The script must contain the calls the page depends on. */
+            CHECK(Contains(script, "function showTab("));
+            CHECK(Contains(script, "refresh()"));
+            CHECK(Contains(script, "/api/capabilities"));
+            CHECK(Contains(script, "/api/devices"));
+        }
+    }
+
     /* ---- devices ---- */
     std::printf("\n=== devices ===\n");
     const std::string devices = HttpGet(port, "/api/devices");
