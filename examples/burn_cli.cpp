@@ -28,6 +28,7 @@
 #endif
 
 static void progressCallback(int percent, const char* status, void* userData) {
+    (void)userData;   /* the CLI needs no per-job context */
     std::cout << "\rProgress: " << percent << "% - " << status << std::flush;
     if (percent >= 100) std::cout << std::endl;
 }

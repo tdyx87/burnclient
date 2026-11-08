@@ -234,8 +234,10 @@ int main(int argc, char** argv) {
                 /* A small no-emulation load-clip is enough to prove the
                  * catalog is written correctly. */
                 { std::ofstream f("hw_clip.bin", std::ios::binary);
-                  std::vector<char> z(2048, 0); z[0] = (char)0xEB; z[1] = 0; z[2] = (char)0x90;
-                  f.write(z.data(), (std::streamsize)z.size()); }
+                  std::vector<unsigned char> z(2048, 0);
+                  z[0] = 0xEB; z[1] = 0x00; z[2] = 0x90;   /* x86 boot jump */
+                  f.write(reinterpret_cast<const char*>(z.data()),
+                          (std::streamsize)z.size()); }
                 o.bootImagePath = "hw_clip.bin";
                 o.bootEmulation = BURN_BOOT_EMU_NONE;
                 o.bootPlatform = BURN_BOOT_PLATFORM_X86;

@@ -125,11 +125,15 @@ static bool WriteWav(const std::string& path, double seconds, unsigned seed) {
 static void TestVersionAndCapabilities() {
     INFO("=== API version and capability table ===\n");
     CHECK(Burn_GetApiVersion() == BURN_API_VERSION);
-    CHECK(BURN_API_VERSION == 3);
+    /* Compile-time constant: MSVC warns about the constant condition, which
+     * is exactly the point of the check. */
+    const bool apiIsV3 = (BURN_API_VERSION == 3);
+    CHECK(apiIsV3);
 
     /* Baseline features exist on every backend. */
     CHECK(Burn_GetCapability(BURN_CAP_IMAGE_BURN) == 1);
-    CHECK(BURN_CAP_CREATE_IMAGE == 1);
+    const bool createImageIsCapOne = (BURN_CAP_CREATE_IMAGE == 1);
+    CHECK(createImageIsCapOne);
 
     INFO("  audio=%d erase=%d multisession=%d udf=%d boot=%d readback=%d raw=%d tray=%d info=%d\n",
          Burn_GetCapability(BURN_CAP_AUDIO_TAO),
