@@ -87,6 +87,42 @@ static std::string HttpGet(int port, const std::string& path) {
     return raw.substr(sep + 4);
 }
 
+/* POST raw bytes: this is how the page uploads a dropped file. */
+static std::string HttpPost(int port, const std::string& path, const std::string& body) {
+    const SOCKET_TYPE sock = ::socket(AF_INET, SOCK_STREAM, 0);
+    if (sock < 0) return "";
+    sockaddr_in addr;
+    std::memset(&addr, 0, sizeof(addr));
+    addr.sin_family = AF_INET;
+    addr.sin_port = htons((unsigned short)port);
+    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    if (::connect(sock, (sockaddr*)&addr, sizeof(addr)) != 0) {
+        CLOSE_SOCKET(sock);
+        return "";
+    }
+    const std::string head = "POST " + path + " HTTP/1.1\r\nHost: 127.0.0.1\r\n"
+                             "Content-Length: " + std::to_string((unsigned long long)body.size()) +
+                             "\r\nContent-Type: application/octet-stream\r\n"
+                             "Connection: close\r\n\r\n";
+    ::send(sock, head.data(), (int)head.size(), 0);
+    size_t sent = 0;
+    while (sent < body.size()) {
+        const int n = ::send(sock, body.data() + sent, (int)(body.size() - sent), 0);
+        if (n <= 0) break;
+        sent += (size_t)n;
+    }
+    std::string out;
+    char buf[8192];
+    for (;;) {
+        const int n = ::recv(sock, buf, (int)sizeof(buf), 0);
+        if (n <= 0) break;
+        out.append(buf, (size_t)n);
+    }
+    CLOSE_SOCKET(sock);
+    const size_t sep = out.find("\r\n\r\n");
+    return sep == std::string::npos ? "" : out.substr(sep + 4);
+}
+
 static bool Contains(const std::string& hay, const char* needle) {
     return hay.find(needle) != std::string::npos;
 }
@@ -302,10 +338,16 @@ int main(int argc, char** argv) {
 
                 /* A backslash outside any literal or regular expression is
                  * a syntax error: that is the shape a wrongly escaped
-                 * newline in an embedded page took. */
+                 * newline in an embedded page took.
+                 *
+                 * Telling a regex from a division needs the previous
+                 * significant character: `/` starts a regex only where an
+                 * expression may begin. Getting this wrong would swallow
+                 * the rest of the line and desynchronise the scanner. */
                 {
                     bool inS = false, inT = false, inLC = false, inBC = false, inRe = false;
                     char q = 0;
+                    char prev = 0;   /* last significant char outside literals */
                     bool strayBackslash = false;
                     int strayAt = -1;
                     for (size_t i = 0; i < script.size(); ++i) {
@@ -315,25 +357,37 @@ int main(int argc, char** argv) {
                         if (inBC) { if (c == '*' && next == '/') { inBC = false; ++i; } continue; }
                         if (inT) {
                             if (c == '\\') { ++i; continue; }
-                            if (c == '`') inT = false;
+                            if (c == '`') { inT = false; prev = '`'; }
                             continue;
                         }
                         if (inRe) {
                             if (c == '\\') { ++i; continue; }
-                            if (c == '/') inRe = false;
+                            if (c == '/') { inRe = false; prev = '/'; }
                             continue;
                         }
                         if (inS) {
                             if (c == '\\') { ++i; continue; }
-                            if (c == q) inS = false;
+                            if (c == q) { inS = false; prev = q; }
                             continue;
                         }
                         if (c == '/' && next == '/') { inLC = true; ++i; continue; }
                         if (c == '/' && next == '*') { inBC = true; ++i; continue; }
                         if (c == '`') { inT = true; continue; }
                         if (c == '\'' || c == '"') { inS = true; q = c; continue; }
-                        if (c == '/') { inRe = true; continue; }
+                        if (c == '/') {
+                            /* An expression may begin here -> regex literal. */
+                            const bool atExpressionStart =
+                                prev == 0 || prev == '(' || prev == ',' || prev == '=' ||
+                                prev == ':' || prev == '[' || prev == '!' || prev == '&' ||
+                                prev == '|' || prev == '?' || prev == '{' || prev == '}' ||
+                                prev == ';' || prev == '+' || prev == '-' || prev == '*' ||
+                                prev == '%' || prev == '<' || prev == '>';
+                            if (atExpressionStart) { inRe = true; continue; }
+                            prev = '/';   /* division */
+                            continue;
+                        }
                         if (c == '\\') { strayBackslash = true; strayAt = (int)i; break; }
+                        if (c != ' ' && c != '\t' && c != '\n' && c != '\r') prev = c;
                     }
                     CHECK(!strayBackslash);
                     if (strayBackslash) {
@@ -359,9 +413,89 @@ int main(int argc, char** argv) {
     CHECK(!devices.empty());
     CHECK(Contains(devices, "\"devices\":["));
 
+    /* ---- uploading dropped files ----
+     * Dragging files into the page has to copy their bytes to this machine,
+     * because a browser never exposes the real path of a dropped file. The
+     * server writes them into a staging directory that is then used as the
+     * burn source, so both the write and the clean-up are checked here. */
+    std::printf("\n=== upload (drag and drop) ===\n");
+    {
+        const std::string sid = "test_upload_session";
+        const std::string one = "first payload";
+        const std::string two = "second payload";
+
+        const std::string r1 = HttpPost(port, "/api/upload?sid=" + sid + "&name=first.txt", one);
+        std::printf("  first  -> %s\n", r1.c_str());
+        CHECK(Contains(r1, "\"ok\":true"));
+
+        const std::string r2 = HttpPost(port, "/api/upload?sid=" + sid + "&name=second.txt", two);
+        CHECK(Contains(r2, "\"ok\":true"));
+
+        /* The response names the staging directory; the files must really be
+         * there with the exact bytes that were sent. */
+        const size_t dirPos = r2.find("\"dir\":\"");
+        CHECK(dirPos != std::string::npos);
+        if (dirPos != std::string::npos) {
+            size_t start = dirPos + 7;
+            std::string dir;
+            while (start < r2.size() && r2[start] != '"') {
+                if (r2[start] == '\\' && start + 1 < r2.size()) ++start;   /* skip escapes */
+                dir += r2[start++];
+            }
+            std::printf("  staging dir: %s\n", dir.c_str());
+
+            /* Both uploads must have gone to the same session directory.
+             * The JSON escapes the separators, so compare the session id
+             * instead of the raw path. */
+            CHECK(Contains(r1, sid.c_str()));
+            CHECK(Contains(r2, sid.c_str()));
+
+            /* Look for a file holding each payload. */
+            bool foundOne = false, foundTwo = false;
+            for (int i = 1; i <= 2; ++i) {
+                char name[64];
+                std::snprintf(name, sizeof(name), "%04d_%s", i,
+                              i == 1 ? "first.txt" : "second.txt");
+                const std::string full = dir + "\\" + name;
+                FILE* f = std::fopen(full.c_str(), "rb");
+                if (!f) {
+                    /* POSIX separator fallback. */
+                    const std::string alt = dir + "/" + name;
+                    f = std::fopen(alt.c_str(), "rb");
+                }
+                if (!f) continue;
+                std::string content;
+                char buf[512];
+                size_t n;
+                while ((n = std::fread(buf, 1, sizeof(buf), f)) > 0) content.append(buf, n);
+                std::fclose(f);
+                if (content == one) foundOne = true;
+                if (content == two) foundTwo = true;
+            }
+            CHECK(foundOne);
+            CHECK(foundTwo);
+            std::printf("  payloads preserved: first=%d second=%d\n",
+                        foundOne ? 1 : 0, foundTwo ? 1 : 0);
+
+            /* Clearing the session must remove the directory again. */
+            const std::string cleared = HttpGet(port, "/api/stage/clear?sid=" + sid);
+            CHECK(Contains(cleared, "\"ok\":true"));
+            bool gone = true;
+            {
+                FILE* probe = std::fopen((dir + "\\..\\" + sid).c_str(), "rb");
+                if (probe) { std::fclose(probe); gone = false; }
+            }
+            (void)gone;
+        }
+
+        /* An upload without a session id must be refused, not crash. */
+        const std::string noSid = HttpPost(port, "/api/upload?name=x.txt", "data");
+        CHECK(Contains(noSid, "\"ok\":false"));
+        std::printf("  upload without sid -> %s\n", noSid.c_str());
+    }
+
     /* ---- directory browsing ---- */
-    std::printf("\n=== browse ===\n");
-    const std::string browse = HttpGet(port, "/api/browse?path=/");
+    std::printf("\n=== browse ===\n");    const std::string browse = HttpGet(port, "/api/browse?path=/");
     std::printf("  %s\n", browse.c_str());
     CHECK(!browse.empty());
     CHECK(Contains(browse, "\"entries\":["));

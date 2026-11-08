@@ -502,6 +502,175 @@ std::string HandleBrowse(const Request& r) {
 }
 
 /* ==========================================================================
+ * Upload staging
+ *
+ * A browser never reveals the real path of a file the user dropped on the
+ * page, so "drag files here and burn them" can only work by copying those
+ * bytes to this machine. The server writes them into a per-session staging
+ * directory and hands that directory back; the burn job then uses it as the
+ * source folder.
+ * ======================================================================== */
+
+/* Keep only characters that are safe in a file name. */
+static std::string SanitizeComponent(const std::string& in) {
+    std::string out;
+    for (size_t i = 0; i < in.size(); ++i) {
+        const unsigned char c = (unsigned char)in[i];
+        if ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+            (c >= '0' && c <= '9') || c == '.' || c == '_' || c == '-') {
+            out += (char)c;
+        } else if (c >= 0x80) {
+            out += (char)c;   /* keep UTF-8 file names intact */
+        }
+    }
+    while (!out.empty() && out[0] == '.') out.erase(out.begin());
+    if (out.size() > 120) out = out.substr(out.size() - 120);
+    if (out.empty()) out = "file";
+    return out;
+}
+
+static std::string StagingRoot() {
+#ifdef _WIN32
+    const char* tmp = std::getenv("TEMP");
+    if (!tmp || !*tmp) tmp = std::getenv("TMP");
+#else
+    /* POSIX prefers TMPDIR; TMP/TEMP are honoured too because the Windows
+     * spelling is what a cross-platform caller usually sets. */
+    const char* tmp = std::getenv("TMPDIR");
+    if (!tmp || !*tmp) tmp = std::getenv("TEMP");
+    if (!tmp || !*tmp) tmp = std::getenv("TMP");
+    if (!tmp || !*tmp) tmp = "/tmp";
+#endif
+    if (!tmp || !*tmp) tmp = ".";
+    return std::string(tmp) + PATHSEP + "burn_webui_stage";
+}
+
+/* Create a directory and its parents, ignoring "already exists". */
+static bool EnsureDir(const std::string& path) {
+    if (IsDirectory(path)) return true;
+    const std::string parent = ParentPath(path);
+    if (!parent.empty() && parent != path && !IsDirectory(parent)) {
+        EnsureDir(parent);
+    }
+#ifdef _WIN32
+    const int rc = _mkdir(path.c_str());
+#else
+    const int rc = mkdir(path.c_str(), 0777);
+#endif
+    return rc == 0 || IsDirectory(path);
+}
+
+/* Delete a directory tree; used when the user clears the list. */
+static void RemoveTree(const std::string& path) {
+    if (!IsDirectory(path)) {
+        std::remove(path.c_str());
+        return;
+    }
+#ifdef _WIN32
+    WIN32_FIND_DATAA data;
+    HANDLE h = FindFirstFileA((path + "\\*").c_str(), &data);
+    if (h != INVALID_HANDLE_VALUE) {
+        do {
+            const std::string name = data.cFileName;
+            if (name == "." || name == "..") continue;
+            const std::string full = path + "\\" + name;
+            if (IsDirectory(full)) RemoveTree(full);
+            else DeleteFileA(full.c_str());
+        } while (FindNextFileA(h, &data));
+        FindClose(h);
+    }
+    RemoveDirectoryA(path.c_str());
+#else
+    DIR* dir = opendir(path.c_str());
+    if (dir) {
+        struct dirent* ent;
+        while ((ent = readdir(dir)) != nullptr) {
+            const std::string name = ent->d_name;
+            if (name == "." || name == "..") continue;
+            const std::string full = path + "/" + name;
+            if (IsDirectory(full)) RemoveTree(full);
+            else std::remove(full.c_str());
+        }
+        closedir(dir);
+    }
+    rmdir(path.c_str());
+#endif
+}
+
+/* Write the request body into the session staging directory. */
+std::string HandleUpload(const Request& r) {
+    const std::string rawSid = Field(r, "sid");
+    if (rawSid.empty()) {
+        return "{\"ok\":false,\"error\":" +
+               JsonString("Missing upload session id") + "}";
+    }
+    std::string sid = SanitizeComponent(rawSid);
+    if (sid.empty()) {
+        return "{\"ok\":false,\"error\":" +
+               JsonString("Invalid upload session id") + "}";
+    }
+    std::string name = Field(r, "name");
+    if (name.empty()) name = "file.bin";
+    /* Only the base name, never a path. */
+    {
+        const size_t slash = name.find_last_of("/\\");
+        if (slash != std::string::npos) name = name.substr(slash + 1);
+    }
+    name = SanitizeComponent(name);
+
+    const std::string dir = StagingRoot() + PATHSEP + sid;
+    if (!EnsureDir(dir)) {
+        return "{\"ok\":false,\"error\":" +
+               JsonString("Cannot create the staging directory: " + dir) + "}";
+    }
+
+    /* Prefix with a counter so two files with the same name both survive. */
+    static std::mutex counterMutex;
+    static unsigned long long counter = 0;
+    unsigned long long serial = 0;
+    {
+        std::lock_guard<std::mutex> lock(counterMutex);
+        serial = ++counter;
+    }
+    char prefix[32];
+    std::snprintf(prefix, sizeof(prefix), "%04llu_", serial);
+    const std::string target = dir + PATHSEP + prefix + name;
+
+    FILE* f = std::fopen(target.c_str(), "wb");
+    if (!f) {
+        return "{\"ok\":false,\"error\":" +
+               JsonString("Cannot write " + target) + "}";
+    }
+    const size_t written = r.body.empty()
+                               ? 0
+                               : std::fwrite(r.body.data(), 1, r.body.size(), f);
+    const int closeErr = (std::fclose(f) != 0);
+    if (written != r.body.size() || closeErr) {
+        std::remove(target.c_str());
+        return "{\"ok\":false,\"error\":" +
+               JsonString("Short write (disk full?) for " + target) + "}";
+    }
+
+    return "{\"ok\":true,\"dir\":" + JsonString(dir) +
+           ",\"path\":" + JsonString(target) +
+           ",\"name\":" + JsonString(name) +
+           ",\"size\":" + std::to_string((unsigned long long)r.body.size()) + "}";
+}
+
+std::string HandleStageClear(const Request& r) {
+    const std::string rawSid = Field(r, "sid");
+    if (rawSid.empty()) {
+        return "{\"ok\":false,\"error\":" + JsonString("Missing session id") + "}";
+    }
+    const std::string sid = SanitizeComponent(rawSid);
+    if (sid.empty()) {
+        return "{\"ok\":false,\"error\":" + JsonString("Invalid session id") + "}";
+    }
+    RemoveTree(StagingRoot() + PATHSEP + sid);
+    return "{\"ok\":true}";
+}
+
+/* ==========================================================================
  * The page
  *
  * It is shipped as a real HTML file next to this source, so that the script
@@ -608,13 +777,41 @@ void SendResponse(SOCKET_TYPE sock, int code, const std::string& contentType,
 std::atomic<int> g_requestLimit{0};
 std::atomic<int> g_servedRequests{0};
 
+/* Case-insensitive header lookup on the raw request head. */
+static bool FindHeader(const std::string& head, const char* name, std::string& out) {
+    const size_t nameLen = std::strlen(name);
+    for (size_t i = 0; i + nameLen < head.size(); ++i) {
+        bool match = true;
+        for (size_t k = 0; k < nameLen && match; ++k) {
+            char a = head[i + k];
+            char b = name[k];
+            if (a >= 'A' && a <= 'Z') a = (char)(a - 'A' + 'a');
+            if (b >= 'A' && b <= 'Z') b = (char)(b - 'A' + 'a');
+            if (a != b) match = false;
+        }
+        if (!match) continue;
+        /* Must be at the start of a line. */
+        if (i != 0 && head[i - 1] != '\n') continue;
+        const size_t colon = head.find(':', i + nameLen);
+        if (colon == std::string::npos) continue;
+        size_t start = colon + 1;
+        while (start < head.size() && (head[start] == ' ' || head[start] == '\t')) ++start;
+        size_t end = head.find("\r\n", start);
+        if (end == std::string::npos) end = head.size();
+        out = head.substr(start, end - start);
+        return true;
+    }
+    return false;
+}
+
 /* The socket handle is passed by value; on Windows SOCKET is a 64-bit
  * handle, so the parameter must not be an int. */
 void HandleConnection(SOCKET_TYPE sock) {
-    /* Read the request head; the body is not used by this UI (all calls are
-     * GET with query parameters). */
+    /* Read the request head, then the body when Content-Length is present.
+     * GET calls carry their parameters in the query; uploads POST raw bytes. */
     std::string raw;
     char buf[8192];
+    size_t headerEnd = std::string::npos;
     for (;;) {
 #ifdef _WIN32
         const int n = ::recv(sock, buf, (int)sizeof(buf), 0);
@@ -623,9 +820,11 @@ void HandleConnection(SOCKET_TYPE sock) {
 #endif
         if (n <= 0) break;
         raw.append(buf, (size_t)n);
-        if (raw.find("\r\n\r\n") != std::string::npos) break;
+        headerEnd = raw.find("\r\n\r\n");
+        if (headerEnd != std::string::npos) break;
         if (raw.size() > 65536) break;
     }
+    if (headerEnd == std::string::npos) { CLOSE_SOCKET(sock); return; }
 
     Request req;
     const size_t sp = raw.find(' ');
@@ -639,6 +838,27 @@ void HandleConnection(SOCKET_TYPE sock) {
     if (q != std::string::npos) {
         req.fields = ParseQuery(req.path.substr(q + 1));
         req.path = req.path.substr(0, q);
+    }
+
+    /* Finish reading the body if the client announced its length. */
+    {
+        std::string lengthHeader;
+        size_t wanted = 0;
+        if (FindHeader(raw.substr(0, headerEnd), "content-length", lengthHeader)) {
+            wanted = (size_t)std::strtoull(lengthHeader.c_str(), nullptr, 10);
+        }
+        std::string bodyBytes = raw.substr(headerEnd + 4);
+        while (bodyBytes.size() < wanted) {
+#ifdef _WIN32
+            const int n = ::recv(sock, buf, (int)sizeof(buf), 0);
+#else
+            const ssize_t n = ::recv(sock, buf, sizeof(buf), 0);
+#endif
+            if (n <= 0) break;
+            bodyBytes.append(buf, (size_t)n);
+        }
+        if (bodyBytes.size() > wanted) bodyBytes.resize(wanted);
+        req.body = bodyBytes;
     }
 
     std::string body;
@@ -672,6 +892,12 @@ void HandleConnection(SOCKET_TYPE sock) {
         type = "application/json; charset=utf-8";
     } else if (req.path == "/api/browse") {
         body = HandleBrowse(req);
+        type = "application/json; charset=utf-8";
+    } else if (req.path == "/api/upload") {
+        body = HandleUpload(req);
+        type = "application/json; charset=utf-8";
+    } else if (req.path == "/api/stage/clear") {
+        body = HandleStageClear(req);
         type = "application/json; charset=utf-8";
     } else if (req.path == "/api/tray") {
         body = HandleTray(req, Field(req, "action") == "eject");

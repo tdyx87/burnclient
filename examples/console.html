@@ -175,6 +175,17 @@
   .files div:hover { background: #1c2431; }
   .files .dir { color: var(--accent); }
 
+  /* ---------- 拖拽区域 ---------- */
+  .dropzone {
+    border: 2px dashed var(--line); border-radius: 12px;
+    background: rgba(13, 17, 23, .4); padding: 30px 20px;
+    text-align: center; cursor: pointer; transition: border-color .2s, background .2s;
+  }
+  .dropzone:hover { border-color: var(--accent); background: rgba(91, 140, 255, .12); }
+  .dropzone .ico { font-size: 32px; line-height: 1; display: block; margin-bottom: 10px; }
+  .dropzone .ttl { font-weight: 700; color: var(--fg); margin-bottom: 6px; font-size: 14px; }
+  .dropzone .dsc { font-size: 13px; color: var(--muted); }
+
   /* ---------- 隐藏面板 ---------- */
   .pane { display: none; }
   .pane.on { display: block; }
@@ -279,15 +290,40 @@
       <!-- 把文件刻成光盘 -->
       <div class="pane on" id="p-data">
         <h2 style="font-size:16px;margin-bottom:4px">把文件刻成光盘</h2>
-        <p class="lead">选择要刻录的内容，然后点下面的按钮。</p>
+        <p class="lead">选择要刻录的文件（可多选、可拖拽），然后点下面的按钮。</p>
 
-        <label for="dataSource">要刻录的文件</label>
-        <p class="hint">可以是一个 <b>.iso</b> 镜像文件，也可以是一个文件夹（会自动打包成光盘）。</p>
-        <input id="dataSource" placeholder="例如：D:\我的文件 或 E:\movie.iso">
+        <label for="dataFiles">要刻录的文件</label>
+        <p class="hint">支持多选和拖拽。选中后会列在下面，刻录时会全部打包到光盘。</p>
 
-        <label for="dataRef">刻完后用来核对的文件（可选）</label>
-        <p class="hint">填了就会在刻录完成后把光盘内容读回来逐字节比对，确认没有刻坏。留空则不检查。</p>
-        <input id="dataRef" placeholder="留空 = 不检查">
+        <!-- 拖拽上传区域 -->
+        <div class="dropzone" id="dropZone">
+          <span class="ico">📁</span>
+          <div>
+            <div class="ttl">把文件拖到这里</div>
+            <div class="dsc">或点击下方按钮选择多个文件</div>
+          </div>
+        </div>
+
+        <div class="row">
+          <div style="flex:1">
+            <button class="btn" id="btnPickFiles" style="width:100%">选择文件</button>
+            <input type="file" id="filePicker" multiple style="display:none">
+          </div>
+          <div style="flex:0 0 90px">
+            <button class="btn" id="btnClearFiles" style="width:100%">清空列表</button>
+          </div>
+        </div>
+
+        <div class="files" id="stagedList"></div>
+        <input type="hidden" id="dataSource" value="">
+
+        <label for="dataPath">或者直接填写路径</label>
+        <p class="hint">
+          用来刻录一个现成的 <b>.iso</b> 镜像或一个<b>文件夹</b>
+          （拖拽无法传入文件夹里的全部内容，这种情况请填路径）。
+          这里填了就以它为准，忽略上面的列表。
+        </p>
+        <input id="dataPath" placeholder="例如：D:\我的文件夹 或 E:\movie.iso">
 
         <label class="check">
           <input type="checkbox" id="dataLeaveOpen">
@@ -752,13 +788,177 @@
     };
   }
 
+  /* ---------- 待刻录文件列表（拖拽 / 多选上传） ----------
+   * 浏览器不会把拖进来的文件真实路径告诉网页，所以这里把文件内容
+   * 上传到本机服务（走回环，等于一次本地复制），服务端写入临时目录，
+   * 刻录时把该目录当作源文件夹。 */
+  var stagedFiles = [];   /* {name, size, path} */
+  var stagedDir = "";
+  var uploadSid = "";
+
+  function newSessionId() {
+    return "s" + Date.now().toString(36) + Math.floor(Math.random() * 1e6).toString(36);
+  }
+
+  function fmtSize(bytes) {
+    if (bytes < 1024) { return bytes + " B"; }
+    if (bytes < 1024 * 1024) { return (bytes / 1024).toFixed(1) + " KB"; }
+    if (bytes < 1024 * 1024 * 1024) { return (bytes / 1048576).toFixed(1) + " MB"; }
+    return (bytes / 1073741824).toFixed(2) + " GB";
+  }
+
+  function renderFileList() {
+    var box = $("stagedList");
+    box.innerHTML = "";
+    if (!stagedFiles.length) {
+      box.innerHTML = '<div style="padding:10px;color:var(--muted);cursor:default">' +
+                      "还没有选择文件。</div>";
+      return;
+    }
+    stagedFiles.forEach(function (item, index) {
+      var row = document.createElement("div");
+      row.style.display = "flex";
+      row.style.justifyContent = "space-between";
+      row.style.cursor = "default";
+      var label = document.createElement("span");
+      label.textContent = "📄 " + item.name + "  (" + fmtSize(item.size) + ")";
+      var kill = document.createElement("span");
+      kill.textContent = "✕";
+      kill.style.color = "var(--err)";
+      kill.style.cursor = "pointer";
+      kill.title = "从列表移除";
+      kill.onclick = function () {
+        stagedFiles.splice(index, 1);
+        renderFileList();
+        log("已从列表移除 " + item.name, "muted");
+      };
+      row.appendChild(label);
+      row.appendChild(kill);
+      box.appendChild(row);
+    });
+  }
+
+  /* Upload one file at a time: simple, and it keeps the server free of a
+   * multipart parser. */
+  function uploadOne(file) {
+    var url = "/api/upload?sid=" + encodeURIComponent(uploadSid) +
+              "&name=" + encodeURIComponent(file.name);
+    return fetch(url, { method: "POST", body: file }).then(function (r) {
+      return r.json();
+    });
+  }
+
+  function uploadFiles(fileList) {
+    var list = [];
+    for (var i = 0; i < fileList.length; i++) { list.push(fileList[i]); }
+    if (!list.length) { return Promise.resolve(); }
+    if (!uploadSid) { uploadSid = newSessionId(); }
+
+    log("正在把 " + list.length + " 个文件传到本机临时目录…", "muted");
+    var chain = Promise.resolve();
+    var failed = 0;
+    list.forEach(function (file) {
+      chain = chain.then(function () {
+        return uploadOne(file).then(function (res) {
+          if (res && res.ok) {
+            stagedDir = res.dir;
+            stagedFiles.push({ name: res.name, size: res.size, path: res.path });
+            renderFileList();
+          } else {
+            failed++;
+            log("✗ 传不上去：" + file.name + " — " +
+                ((res && res.error) || "未知错误"), "err");
+          }
+        });
+      });
+    });
+    return chain.then(function () {
+      if (failed === 0) {
+        log("✔ 已就绪，共 " + stagedFiles.length + " 个文件", "ok");
+      }
+    });
+  }
+
+  /* 拖拽 */
+  (function () {
+    var zone = $("dropZone");
+    if (!zone) { return; }
+    ["dragenter", "dragover"].forEach(function (name) {
+      zone.addEventListener(name, function (e) {
+        e.preventDefault();
+        e.stopPropagation();
+        zone.style.borderColor = "var(--accent)";
+        zone.style.background = "rgba(91,140,255,.16)";
+      });
+    });
+    ["dragleave", "drop"].forEach(function (name) {
+      zone.addEventListener(name, function (e) {
+        e.preventDefault();
+        e.stopPropagation();
+        zone.style.borderColor = "";
+        zone.style.background = "";
+      });
+    });
+    zone.addEventListener("drop", function (e) {
+      var dt = e.dataTransfer;
+      if (!dt) { return; }
+      /* A dropped folder would need a recursive walk; say so plainly. */
+      var items = dt.items;
+      if (items && items.length && items[0].webkitGetAsEntry) {
+        var entry = items[0].webkitGetAsEntry();
+        if (entry && entry.isDirectory) {
+          log("拖入的是文件夹。浏览器无法读取文件夹里的全部内容，" +
+              "请在下面「或者直接填写路径」里填写文件夹路径。", "warn");
+          return;
+        }
+      }
+      if (dt.files && dt.files.length) { uploadFiles(dt.files); }
+    });
+    zone.onclick = function () { $("filePicker").click(); };
+  })();
+
+  $("btnPickFiles").onclick = function (e) {
+    e.preventDefault();
+    $("filePicker").click();
+  };
+
+  $("filePicker").onchange = function () {
+    if (this.files && this.files.length) { uploadFiles(this.files); }
+    this.value = "";   /* allow picking the same file again */
+  };
+
+  $("btnClearFiles").onclick = function () {
+    stagedFiles = [];
+    renderFileList();
+    if (uploadSid) {
+      api("/api/stage/clear", { sid: uploadSid });
+      uploadSid = "";
+      stagedDir = "";
+    }
+    log("已清空文件列表", "muted");
+  };
+
+  renderFileList();
+
   /* ---------- 各个任务 ---------- */
   $("btnData").onclick = function () {
     var p = common();
     p.mode = 0;
-    p.source = $("dataSource").value;
     p.leaveOpen = $("dataLeaveOpen").checked ? 1 : 0;
-    if (!p.source) { log("请先填写要刻录的文件路径", "warn"); return; }
+
+    /* An explicit path wins: it can also name a folder or an existing ISO,
+     * which a drag-and-drop upload cannot express. */
+    var typed = $("dataPath").value.trim();
+    if (typed) {
+      p.source = typed;
+    } else if (stagedFiles.length && stagedDir) {
+      p.source = stagedDir;
+    } else {
+      log("请先拖入或选择要刻录的文件，或者在「直接填写路径」里填写路径", "warn");
+      return;
+    }
+    /* Read-back verification is driven by the 「刻完后检查」 level: the
+     * engine compares the disc with the image it just wrote. */
     runJob(p, "刻录数据盘");
   };
 
@@ -880,7 +1080,7 @@
           } else if (/\.wav$/i.test(name)) {
             $("audioTracks").value += (($("audioTracks").value ? "\n" : "") + full);
           } else if (/\.iso$/i.test(name)) {
-            $("dataSource").value = full;
+            $("dataPath").value = full;
           } else if (/\.(img|bin)$/i.test(name)) {
             $("isoBoot").value = full;
           } else if (/\.raw$/i.test(name)) {
