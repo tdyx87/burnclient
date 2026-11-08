@@ -1,5 +1,6 @@
 #include "burning_utility.h"
 #include "burn_internal.h"
+#include "unix_features.h"
 #include <string>
 #include <vector>
 #include <memory>
@@ -74,14 +75,37 @@ static void UnixCancelHook(void* context) {
 
 namespace {
 
-DeviceInfo MakeFallbackDevice() {
-    DeviceInfo info = {};
-    info.isWritable = 1;
-    info.isEmpty = 1;
-    strncpy(info.mediaType, "CD/DVD", sizeof(info.mediaType) - 1);
-    strncpy(info.devicePath, "/dev/sr0", sizeof(info.devicePath) - 1);
-    strncpy(info.deviceName, "Default Optical Drive", sizeof(info.deviceName) - 1);
-    return info;
+/* MMC profile numbers of recordable media (mmc5r03c.pdf table 89, mirrored
+ * by the burn_disc_get_profile() docs of libburn 1.5.2). */
+enum MmcProfile {
+    PROFILE_CD_ROM              = 0x08,
+    PROFILE_CD_R                = 0x09,
+    PROFILE_CD_RW               = 0x0A,
+    PROFILE_DVD_ROM             = 0x10,
+    PROFILE_DVD_R_SEQ           = 0x11,
+    PROFILE_DVD_RAM             = 0x12,
+    PROFILE_DVD_RW_RO           = 0x13,
+    PROFILE_DVD_R_DLT           = 0x14,
+    PROFILE_DVD_PLUS_RW         = 0x1A,
+    PROFILE_DVD_PLUS_R          = 0x1B,
+    PROFILE_DVD_PLUS_R_DL       = 0x2B,
+    PROFILE_BD_ROM              = 0x40,
+    PROFILE_BD_R_SEQ            = 0x41,
+    PROFILE_BD_RE               = 0x43,
+    PROFILE_LIBBURN_STDIO       = 0xFFFF  /* not a MMC profile; file device */
+};
+
+/* Write-speed unit for one speed multiplier of the given media family,
+ * in k/s (libburn counts "k" as 1000). Values from the libburn 1.5.2
+ * burn_drive_set_speed() header doc: 1xCD = 176.4 k/s (round up -> 177),
+ * 1xDVD = 1385 k/s, 1xBD = 4496 k/s. */
+static int KsPerOneX(char family) {
+    switch (family) {
+    case 'C': return 177;
+    case 'D': return 1385;
+    case 'B': return 4496;
+    default:  return 1385;
+    }
 }
 
 } /* namespace */
@@ -121,7 +145,10 @@ public:
         std::vector<DeviceInfo> devices;
 
         if (!burnReady_) {
-            devices.push_back(MakeFallbackDevice());
+            /* No fabricated /dev/sr0: when libburn cannot start there is
+             * provably nothing to report, and inventing a writable device
+             * makes integration tests burn air instead of skipping. */
+            SetBurnLastError("Failed to initialize libburn");
             return devices;
         }
 
@@ -135,26 +162,59 @@ public:
             usleep(100000); /* 100ms poll */
         }
 
-        if (scan_ret < 0 || drive_count == 0) {
+        if (scan_ret < 0) {
+            SetBurnLastError("Drive scan failed");
+            if (drive_list) {
+                burn_drive_info_free(drive_list);
+            }
+            return devices;
+        }
+        if (drive_count == 0) {
             SetBurnLastError("No drives found");
             if (drive_list) {
                 burn_drive_info_free(drive_list);
             }
-            /* Provide a sensible fallback so callers still get a device path */
-            devices.push_back(MakeFallbackDevice());
             return devices;
         }
 
         for (unsigned int i = 0; i < drive_count; ++i) {
             DeviceInfo info = {};
-            info.isWritable = 1;
+
+            /* Honest writability from the capability bits burn_drive_scan()
+             * filled during enumeration. This needs no grab (which would
+             * spin drives up and (O_EXCL) lock them out of other programs
+             * during a UI refresh). Documented blind spot of the bitfields:
+             * drives that ONLY write DVD-RW/DVD+R/DVD+RW/BD media do not set
+             * any of these bits and are reported read-only here; their true
+             * capability list is only available after a grab via
+             * burn_drive_get_all_profiles(). Chosen trade-off: never
+             * over-claim. */
+            info.isWritable = (drive_list[i].write_cdr
+                               || drive_list[i].write_cdrw
+                               || drive_list[i].write_dvdr
+                               || drive_list[i].write_dvdram) ? 1 : 0;
+
+            /* Media state is not inquired during enumeration (a grab would
+             * be needed to query the loaded disc; drive spin-up as a side
+             * effect of a list refresh is not acceptable). Report unknown as
+             * "assumed blank" like the other backends, documented in the
+             * public header. */
             info.isEmpty = 1;
-            strncpy(info.mediaType, "CD/DVD", sizeof(info.mediaType) - 1);
+
+            if (drive_list[i].write_cdr || drive_list[i].write_cdrw) {
+                strncpy(info.mediaType, "CD-R/CD-RW", sizeof(info.mediaType) - 1);
+            } else if (info.isWritable) {
+                strncpy(info.mediaType, "DVD-R/DVD-RAM", sizeof(info.mediaType) - 1);
+            } else {
+                strncpy(info.mediaType, "CD/DVD (read-only)", sizeof(info.mediaType) - 1);
+            }
 
             /* Use burn_drive_d_get_adr() instead of deprecated .location field */
             char adr[BURN_DRIVE_ADR_LEN] = {0};
             if (burn_drive_d_get_adr(drive_list[i].drive, adr) > 0 && adr[0]) {
-                snprintf(info.devicePath, sizeof(info.devicePath), "%s", adr);
+                /* BURN_DRIVE_ADR_LEN (1024) is larger than devicePath (512):
+                 * clamp the precision so the compiler and reality agree. */
+                snprintf(info.devicePath, sizeof(info.devicePath), "%.511s", adr);
             } else {
                 /* Fallback to deprecated location field */
                 snprintf(info.devicePath, sizeof(info.devicePath), "%s", drive_list[i].location);
@@ -203,13 +263,58 @@ public:
 
         NotifyProgressBurn(30, "Preparing disc...");
 
+        /* burn_drive_set_speed() counts k/s (k = 1000), NOT speed multipliers.
+         * 1x is media-family specific: CD 176.4 k/s (rounded up per upstream
+         * rule), DVD 1385 k/s, BD 4496 k/s. The old code passed speed*1000,
+         * which asked for e.g. 4000 k/s = ~22x CD. Read speed is now left
+         * at 0 = drive maximum; the old call also clamped reads to the
+         * write speed. */
         if (speed > 0) {
-            burn_drive_set_speed(drive, speed * 1000, speed * 1000);
+            char family = 'D';
+            int pno = 0;
+            char pname[80] = {0};
+            if (burn_disc_get_profile(drive, &pno, pname) == 1) {
+                if (pno == PROFILE_CD_R || pno == PROFILE_CD_RW) family = 'C';
+                else if (pno == PROFILE_BD_R_SEQ || pno == PROFILE_BD_RE) family = 'B';
+            } else if (!discType.empty()) {
+                /* No media answer yet: fall back to the requested type text. */
+                char c = discType[0];
+                if (c == 'C' || c == 'c') family = 'C';
+                else if (c == 'B' || c == 'b') family = 'B';
+            }
+            long long ks = (long long)speed * KsPerOneX(family);
+            int maxKs = burn_drive_get_write_speed(drive); /* k/s, <=0 unknown */
+            if (maxKs > 0 && ks > maxKs) ks = maxKs;
+            if (ks < 1) ks = 1;
+            burn_drive_set_speed(drive, 0, (int)ks);
         }
 
-        enum burn_disc_status status = burn_disc_get_status(drive);
+        /* burn_disc_get_status() may need more than one call to settle
+         * (documented; BURN_DISC_UNREADY = "status not yet known"). The old
+         * single call falsely failed with "not blank or appendable" on slow
+         * drives. */
+        enum burn_disc_status status = BURN_DISC_UNREADY;
+        for (int attempt = 0; attempt < 40 && !IsBurnCancelled(); ++attempt) {
+            status = burn_disc_get_status(drive);
+            if (status != BURN_DISC_UNREADY) break;
+            usleep(250000); /* 250ms, up to 10s total */
+        }
+        if (IsBurnCancelled()) {
+            SetBurnLastError("Burn cancelled by caller");
+            burn_drive_release(drive, 0);
+            burn_drive_info_free(drive_info);
+            return false;
+        }
+        if (status == BURN_DISC_EMPTY) {
+            SetBurnLastError("No disc in drive: " + devicePath);
+            burn_drive_release(drive, 0);
+            burn_drive_info_free(drive_info);
+            return false;
+        }
         if (status != BURN_DISC_BLANK && status != BURN_DISC_APPENDABLE) {
-            SetBurnLastError("Disc is not blank or appendable");
+            SetBurnLastError(status == BURN_DISC_UNREADY
+                             ? "Disc status could not be determined"
+                             : "Disc is not blank or appendable");
             burn_drive_release(drive, 0);
             burn_drive_info_free(drive_info);
             return false;
@@ -312,8 +417,17 @@ public:
         ClearBurnCancelHook(UnixCancelHook, &cancelCtx);
 
         /* burn_drive_wrote_well() is the authoritative result of the most
-         * recent asynchronous burn_disc_write() (1 = ok, 0 = failed). */
-        bool burn_ok = !cancelled && (burn_drive_wrote_well(drive) > 0);
+         * recent asynchronous burn_disc_write() (1 = ok, 0 = failed).
+         * Decide success BEFORE honouring a late cancellation: a cancel
+         * that lands after the drive finished writing must not report a
+         * good disc as merely "cancelled", or the caller skips its verify
+         * step on a disc that is actually complete. */
+        bool wroteOk = (burn_drive_wrote_well(drive) > 0);
+        if (cancelled && wroteOk) {
+            /* The write completed before the abort took effect. */
+            cancelled = false;
+        }
+        bool burn_ok = !cancelled && wroteOk;
 
         burn_write_opts_free(opts);
         burn_track_free(track);
@@ -420,6 +534,7 @@ public:
         char buf[65536];
         off_t written = 0;
         bool cancelled = false;
+        bool writeError = false;
         while (written < total) {
             if (IsBurnCancelled()) {
                 cancelled = true;
@@ -434,7 +549,15 @@ public:
                 r = burn_src->read_xt(burn_src, (unsigned char*)buf, to_read);
             }
             if (r <= 0) break;
-            fwrite(buf, 1, (size_t)r, f);
+            /* written must advance by what fwrite REALLY stored, else the
+             * `written < total` guard below cannot see a full disk: the
+             * source read succeeds, fread-like progress looks perfect, and
+             * only the output write fails. */
+            size_t stored = fwrite(buf, 1, (size_t)r, f);
+            if (stored != (size_t)r) {
+                writeError = true;
+                break;
+            }
             written += r;
             int pct = total > 0 ? (int)(written * 100 / total) : 100;
             if (pct > 50 && pct < 100) {
@@ -447,7 +570,10 @@ public:
         /* Use burn_source_free() which handles refcounting and calls free_data */
         burn_source_free(burn_src);
         iso_write_opts_free(opts);
-        fclose(f);
+
+        /* fclose() flushes the stdio buffer; a buffered tail that fails to
+         * reach the disk only reports its error HERE, never on fwrite. */
+        int closeErr = (fclose(f) != 0);
         iso_image_unref(image);
 
         if (cancelled) {
@@ -455,9 +581,11 @@ public:
             SetBurnLastError("ISO creation cancelled by caller");
             return false;
         }
-        if (written < total) {
+        if (writeError || closeErr || written < total) {
             remove(isoPath.c_str());
-            SetBurnLastError("ISO image was truncated while writing");
+            SetBurnLastError(written < total && !writeError && !closeErr
+                             ? "ISO image was truncated while writing"
+                             : "ISO write failed (disk full or I/O error)");
             return false;
         }
 
@@ -467,6 +595,63 @@ public:
 
     std::string GetPlatformInfo() override {
         return "Linux/Unix (libburn/libisofs)";
+    }
+
+    /* ---- API version 3 capabilities, implemented in unix_features.cpp ---- */
+
+    int Capability(int capability) override { return burnunix::Capability(capability); }
+
+    long long NextSessionStartBlock(const std::string& devicePath) override {
+        return burnunix::NextSessionStartBlock(devicePath);
+    }
+
+    bool CreateImage(const BurnImageSpec& spec) override {
+        return burnunix::CreateImage(spec);
+    }
+
+    bool BurnImageFile(const std::string& imagePath, const std::string& devicePath,
+                       const std::string& discType, int speed, int verifyLevel,
+                       bool finalize, unsigned long long sessionStartBlock) override {
+        return burnunix::BurnImageFile(imagePath, devicePath, discType, speed,
+                                       verifyLevel, finalize, sessionStartBlock);
+    }
+
+    bool BurnAudioTracks(const std::vector<BurnAudioTrackSpec>& tracks,
+                         const std::string& devicePath, int speed,
+                         int verifyLevel, bool finalizeDisc) override {
+        return burnunix::BurnAudioTracks(tracks, devicePath, speed, verifyLevel, finalizeDisc);
+    }
+
+    bool EraseDisc(const std::string& devicePath, bool full) override {
+        return burnunix::EraseDisc(devicePath, full);
+    }
+
+    bool CreateRawImage(const std::vector<BurnAudioTrackSpec>& tracks,
+                        const std::string& outputPath, const std::string& mcn,
+                        int startingTrackNumber) override {
+        return burnunix::CreateRawImage(tracks, outputPath, mcn, startingTrackNumber);
+    }
+
+    bool BurnRawImage(const std::string& imagePath, const std::string& devicePath,
+                      int speed, int verifyLevel) override {
+        return burnunix::BurnRawImage(imagePath, devicePath, speed, verifyLevel);
+    }
+
+    bool VerifyWrite(const std::string& devicePath, const std::string& expectedImagePath,
+                     int level) override {
+        return burnunix::VerifyWrite(devicePath, expectedImagePath, level);
+    }
+
+    int EjectTray(const std::string& devicePath) override {
+        return burnunix::EjectTray(devicePath);
+    }
+
+    int CloseTray(const std::string& devicePath) override {
+        return burnunix::CloseTray(devicePath);
+    }
+
+    std::string DriveInformation(const std::string& devicePath) override {
+        return burnunix::DriveInformation(devicePath);
     }
 
     bool CheckToolAvailability(const std::string& toolName) override {

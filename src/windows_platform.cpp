@@ -1,5 +1,6 @@
 #include "burning_utility.h"
 #include "burn_internal.h"
+#include "windows_features.h"
 #include <string>
 #include <vector>
 #include <memory>
@@ -321,7 +322,6 @@ public:
 
     bool BurnISO(const std::string& isoPath, const std::string& devicePath,
                  const std::string& discType, int speed) override {
-        (void)discType;
         NotifyProgressBurn(10, "Initializing burn process...");
         if (IsBurnCancelled()) {
             SetBurnLastError("Burn cancelled by caller");
@@ -409,10 +409,73 @@ public:
         SysFreeString(clientName);
 
         if (speed > 0) {
-            /* IDiscFormat2Data has no put_RequestedWriteSpeed (the property
-             * is get-only). Write speed is set with SetWriteSpeed() and is
-             * expressed in sectors per second. */
-            pDataWriter->SetWriteSpeed(speed * 1000, VARIANT_FALSE);
+            /* SetWriteSpeed() counts DISC SECTORS per second (2048 B each),
+             * not speed multipliers. 1x is media-family specific:
+             *   CD 1x = 75 sectors/s        (176.4 kB/s)
+             *   DVD 1x = 676 sectors/s      (1385 kB/s)
+             *   BD 1x  = 2195 sectors/s     (4496 kB/s)
+             * The old code passed speed*1000, so 4x requested 4000 s/s =
+             * ~53x CD / ~6x DVD. IMAPI2 silently clamps an unsupported
+             * value to the nearest supported one (S_IMAPI_SPEEDADJUSTED),
+             * which made the wrong unit invisible - but the multiplier was
+             * still meaningless.
+             *
+             * Media family comes from the first IWriteSpeedDescriptor the
+             * recorder reports (IDiscFormat2Data has no media-family
+             * property; this is the only header-verified source). If that
+             * fails we fall back to the requested disc type text, and if
+             * even that is unusable we leave the drive at its default
+             * "fastest supported" speed instead of sending a number whose
+             * unit we cannot establish. */
+            int baseSectors = 0;
+            SAFEARRAY* descs = nullptr;
+            if (SUCCEEDED(pDataWriter->get_SupportedWriteSpeedDescriptors(&descs))
+                && descs) {
+                LONG lb = 0, ub = -1;
+                if (SUCCEEDED(SafeArrayGetLBound(descs, 1, &lb)) &&
+                    SUCCEEDED(SafeArrayGetUBound(descs, 1, &ub)) && ub >= lb) {
+                    IDispatch* d = nullptr;
+                    if (SUCCEEDED(SafeArrayGetElement(descs, &lb, &d)) && d) {
+                        IWriteSpeedDescriptor* wsd = nullptr;
+                        if (SUCCEEDED(d->QueryInterface(__uuidof(IWriteSpeedDescriptor),
+                                                        (void**)&wsd)) && wsd) {
+                            IMAPI_MEDIA_PHYSICAL_TYPE mt = IMAPI_MEDIA_TYPE_UNKNOWN;
+                            if (SUCCEEDED(wsd->get_MediaType(&mt))) {
+                                switch (mt) {
+                                case IMAPI_MEDIA_TYPE_CDROM: case IMAPI_MEDIA_TYPE_CDR:
+                                case IMAPI_MEDIA_TYPE_CDRW: case IMAPI_MEDIA_TYPE_DISK:
+                                    baseSectors = 75; break;
+                                case IMAPI_MEDIA_TYPE_BDROM: case IMAPI_MEDIA_TYPE_BDR:
+                                case IMAPI_MEDIA_TYPE_BDRE: case IMAPI_MEDIA_TYPE_HDDVDROM:
+                                case IMAPI_MEDIA_TYPE_HDDVDR: case IMAPI_MEDIA_TYPE_HDDVDRAM:
+                                    baseSectors = 2195; break;
+                                default:
+                                    if (mt != IMAPI_MEDIA_TYPE_UNKNOWN) baseSectors = 676;
+                                    break;
+                                }
+                            }
+                            wsd->Release();
+                        }
+                        d->Release();
+                    }
+                }
+                SafeArrayDestroy(descs);
+            }
+            if (baseSectors == 0 && !discType.empty()) {
+                char c = discType[0];
+                if (c == 'C' || c == 'c') baseSectors = 75;
+                else if (c == 'B' || c == 'b') baseSectors = 2195;
+                else baseSectors = 676;
+            }
+            if (baseSectors > 0) {
+                long long target = (long long)speed * baseSectors;
+                if (target > 0x7FFFFFFFLL) target = 0x7FFFFFFFLL;
+                /* Deliberately not failing on a rejected speed: the drive
+                 * keeps its own default when the hint cannot be honoured. */
+                HRESULT spdHr = pDataWriter->SetWriteSpeed((LONG)target,
+                                                           VARIANT_FALSE);
+                (void)spdHr;
+            }
         }
 
         IStream* pStream = nullptr;
@@ -472,120 +535,99 @@ public:
         pRecorder->Release();
         pDiscMaster->Release();
 
+        /* Success first, cancellation second: Write() returned S_OK only if
+         * the disc was actually written. A cancel that arrived while the
+         * last sectors were being burned (the CancelWrite hook raced the
+         * finish line) must not turn a good disc into a "cancelled" result -
+         * the caller would skip verification on complete data. */
+        if (SUCCEEDED(hr)) {
+            NotifyProgressBurn(100, "Burn completed");
+            return true;
+        }
         if (IsBurnCancelled()) {
             SetBurnLastError("Burn cancelled by caller");
             return false;
         }
-        if (FAILED(hr)) {
-            SetBurnLastError("Burn write failed");
-            return false;
+        {
+            char msg[128];
+            snprintf(msg, sizeof(msg), "Burn write failed (HRESULT 0x%08lX)",
+                     (unsigned long)hr);
+            SetBurnLastError(msg);
         }
-
-        NotifyProgressBurn(100, "Burn completed");
-        return true;
-    }
-
-    bool CreateISO(const std::string& sourcePath, const std::string& isoPath,
-                   const std::string& volumeLabel) override {
-        NotifyProgressBurn(10, "Creating ISO image...");
-        if (IsBurnCancelled()) {
-            SetBurnLastError("ISO creation cancelled by caller");
-            return false;
-        }
-
-        IFileSystemImage* pFsImage = nullptr;
-        HRESULT hr = CoCreateInstance(CLSID_MsftFileSystemImage, nullptr, CLSCTX_INPROC_SERVER,
-                                      IID_IFileSystemImage, (void**)&pFsImage);
-        if (FAILED(hr)) {
-            SetBurnLastError("Failed to create IFileSystemImage");
-            return false;
-        }
-
-        /* Set volume name */
-        int wlen = MultiByteToWideChar(CP_UTF8, 0, volumeLabel.c_str(), -1, nullptr, 0);
-        if (wlen > 0) {
-            wchar_t* wbuf = new wchar_t[wlen];
-            MultiByteToWideChar(CP_UTF8, 0, volumeLabel.c_str(), -1, wbuf, wlen);
-            BSTR bstrLabel = SysAllocString(wbuf);
-            pFsImage->put_VolumeName(bstrLabel);
-            SysFreeString(bstrLabel);
-            delete[] wbuf;
-        }
-
-        /* The bitwise OR of two enum values is an int in C++; cast back. */
-        pFsImage->put_FileSystemsToCreate(
-            static_cast<FsiFileSystems>(FsiFileSystemISO9660 | FsiFileSystemJoliet));
-
-        /* Correct API: use IFsiDirectoryItem->AddTree to import a directory. */
-        IFsiDirectoryItem* pRootDir = nullptr;
-        hr = pFsImage->get_Root(&pRootDir);
-        if (SUCCEEDED(hr) && pRootDir) {
-            int slen = MultiByteToWideChar(CP_UTF8, 0, sourcePath.c_str(), -1, nullptr, 0);
-            if (slen > 0) {
-                wchar_t* wbuf = new wchar_t[slen];
-                MultiByteToWideChar(CP_UTF8, 0, sourcePath.c_str(), -1, wbuf, slen);
-                BSTR bstrSource = SysAllocString(wbuf);
-                hr = pRootDir->AddTree(bstrSource, VARIANT_FALSE);
-                if (FAILED(hr)) {
-                    SetBurnLastError("Failed to add source directory to ISO image");
-                }
-                SysFreeString(bstrSource);
-                delete[] wbuf;
-            }
-            pRootDir->Release();
-        } else {
-            SetBurnLastError("Failed to get root directory of ISO image");
-        }
-
-        NotifyProgressBurn(50, "Writing ISO file...");
-
-        IFileSystemImageResult* pResult = nullptr;
-        hr = pFsImage->CreateResultImage(&pResult);
-        if (FAILED(hr)) {
-            SetBurnLastError("Failed to create ISO result image");
-            pFsImage->Release();
-            return false;
-        }
-
-        bool ok = false;
-        IStream* pStream = nullptr;
-        pResult->get_ImageStream(&pStream);
-        if (pStream) {
-            FILE* f = fopen(isoPath.c_str(), "wb");
-            if (f) {
-                char buf[65536];
-                ULONG read = 0;
-                while (SUCCEEDED(pStream->Read(buf, sizeof(buf), &read)) && read > 0) {
-                    fwrite(buf, 1, read, f);
-                    if (IsBurnCancelled()) break;
-                }
-                fclose(f);
-                /* A cancelled or truncated write must not be reported as a
-                 * usable image - remove the partial file. */
-                if (IsBurnCancelled()) {
-                    remove(isoPath.c_str());
-                    SetBurnLastError("ISO creation cancelled by caller");
-                } else {
-                    ok = true;
-                }
-            } else {
-                SetBurnLastError("Cannot open output file: " + isoPath);
-            }
-            pStream->Release();
-        } else {
-            SetBurnLastError("ISO result image has no stream");
-        }
-
-        pResult->Release();
-        pFsImage->Release();
-
-        if (!ok) return false;
-        NotifyProgressBurn(100, "ISO creation completed");
-        return true;
+        return false;
     }
 
     std::string GetPlatformInfo() override {
         return "Windows (IMAPI2)";
+    }
+
+    /* ---- API version 3 capabilities, implemented in windows_features.cpp ---- */
+
+    int Capability(int capability) override { return burnwin::Capability(capability); }
+
+    long long NextSessionStartBlock(const std::string& devicePath) override {
+        return burnwin::NextSessionStartBlock(devicePath);
+    }
+
+    bool CreateISO(const std::string& sourcePath, const std::string& isoPath,
+                   const std::string& volumeLabel) override {
+        BurnImageSpec spec;
+        spec.sourcePath = sourcePath;
+        spec.outputPath = isoPath;
+        spec.volumeLabel = volumeLabel;
+        /* fileSystems 0 => ISO9660+Joliet, exactly the historical default. */
+        return burnwin::CreateImage(spec);
+    }
+
+    bool CreateImage(const BurnImageSpec& spec) override {
+        return burnwin::CreateImage(spec);
+    }
+
+    /* BurnISO above keeps its own (already verified) implementation; this
+     * override only exists to carry the version 3 write options. */
+    bool BurnImageFile(const std::string& imagePath, const std::string& devicePath,
+                       const std::string& discType, int speed, int verifyLevel,
+                       bool finalize, unsigned long long sessionStartBlock) override {
+        return burnwin::BurnImageFile(imagePath, devicePath, discType, speed,
+                                      verifyLevel, finalize, sessionStartBlock);
+    }
+
+    bool BurnAudioTracks(const std::vector<BurnAudioTrackSpec>& tracks,
+                         const std::string& devicePath, int speed,
+                         int verifyLevel, bool finalizeDisc) override {
+        return burnwin::BurnAudioTracks(tracks, devicePath, speed, verifyLevel, finalizeDisc);
+    }
+
+    bool EraseDisc(const std::string& devicePath, bool full) override {
+        return burnwin::EraseDisc(devicePath, full);
+    }
+
+    bool CreateRawImage(const std::vector<BurnAudioTrackSpec>& tracks,
+                        const std::string& outputPath, const std::string& mcn,
+                        int startingTrackNumber) override {
+        return burnwin::CreateRawImage(tracks, outputPath, mcn, startingTrackNumber);
+    }
+
+    bool BurnRawImage(const std::string& imagePath, const std::string& devicePath,
+                      int speed, int verifyLevel) override {
+        return burnwin::BurnRawImage(imagePath, devicePath, speed, verifyLevel);
+    }
+
+    bool VerifyWrite(const std::string& devicePath, const std::string& expectedImagePath,
+                     int level) override {
+        return burnwin::VerifyWrite(devicePath, expectedImagePath, level);
+    }
+
+    int EjectTray(const std::string& devicePath) override {
+        return burnwin::EjectTray(devicePath);
+    }
+
+    int CloseTray(const std::string& devicePath) override {
+        return burnwin::CloseTray(devicePath);
+    }
+
+    std::string DriveInformation(const std::string& devicePath) override {
+        return burnwin::DriveInformation(devicePath);
     }
 
     bool CheckToolAvailability(const std::string& toolName) override {

@@ -37,9 +37,15 @@ set(CMAKE_ARCHIVE_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/lib)
 set(SOURCES
     src/burning_utility.cpp
     src/windows_platform.cpp
+    src/windows_features.cpp
     src/unix_platform.cpp
+    src/unix_features.cpp
     src/mac_platform.cpp
+    src/platform_defaults.cpp
     src/burn_internal.h
+    src/media_format.h
+    src/windows_features.h
+    src/unix_features.h
 )
 
 set(HEADERS

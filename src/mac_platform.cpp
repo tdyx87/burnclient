@@ -186,14 +186,39 @@ static std::string FailureDetail(const std::string& output, int rc) {
     return "exit code " + std::to_string(rc);
 }
 
-static DeviceInfo MakeDevice(const char* path, const char* name, const char* media) {
+static DeviceInfo MakeDevice(const char* path, const char* name, const char* media,
+                             int writable) {
     DeviceInfo info = {};
-    info.isWritable = 1;
+    info.isWritable = writable;
+    /* Media state is not inquired during enumeration: drutil status/discinfo
+     * would spin drives up as a side effect of a UI refresh. Assumed blank,
+     * documented in the public header. */
     info.isEmpty = 1;
     strncpy(info.devicePath, path, sizeof(info.devicePath) - 1);
     strncpy(info.deviceName, name, sizeof(info.deviceName) - 1);
     strncpy(info.mediaType, media, sizeof(info.mediaType) - 1);
     return info;
+}
+
+/* Count the numbered device rows of `drutil list` output, e.g.
+ *   Device: Revision:
+ *   1:      01.0a
+ * One "N:" line is one burning device. RunCommand merges stderr into the
+ * pipe, so match the row shape instead of guessing from words like "No". */
+static int CountDrutilRows(const std::string& output) {
+    int rows = 0;
+    size_t pos = 0;
+    while (pos < output.size()) {
+        size_t eol = output.find('\n', pos);
+        if (eol == std::string::npos) eol = output.size();
+        size_t s = pos;
+        while (s < eol && (output[s] == ' ' || output[s] == '\t' || output[s] == '\r')) ++s;
+        size_t d = s;
+        while (d < eol && output[d] >= '0' && output[d] <= '9') ++d;
+        if (d > s && d < eol && output[d] == ':') ++rows;
+        pos = eol + 1;
+    }
+    return rows;
 }
 
 } /* namespace */
@@ -205,25 +230,39 @@ public:
         std::string output;
         int rc = RunCommand({"drutil", "list"}, &output);
 
-        /* drutil writes a table to stdout. Rather than depend on its exact
-         * column layout (which differs between macOS releases), expose the
-         * default burner - drutil burn targets it when no -drive is given. */
-        bool hasBurner = (rc == 0 &&
-                          output.find("No") == std::string::npos &&
-                          !output.empty());
-        if (hasBurner) {
-            devices.push_back(MakeDevice("default", "Default Optical Drive (drutil)", "CD/DVD"));
-        } else {
-            devices.push_back(MakeDevice("default", "No optical drive detected", "CD/DVD"));
+        if (rc == -1) {
+            /* drutil could not be started at all (missing, sandboxed,
+             * stripped PATH). That is NOT "no optical drive" - report the
+             * truth and leave the list empty instead of inventing a
+             * writable "default" device. */
+            SetBurnLastError("drutil is not available on this system");
+            return devices;
+        }
+
+        int rows = CountDrutilRows(output);
+        if (rows <= 0) {
+            /* drutil list enumerates BURNING devices only; zero rows means
+             * no recorder (or none usable). Honest empty list. */
+            SetBurnLastError("No burning devices reported by drutil");
+            return devices;
+        }
+
+        for (int i = 1; i <= rows; ++i) {
+            char idx[16];
+            snprintf(idx, sizeof(idx), "%d", i);
+            char name[64];
+            snprintf(name, sizeof(name), "Optical drive #%d (drutil)", i);
+            /* drutil's own man page defines `list` as the burning-device
+             * list, so a listed device is a recorder: writable = 1. */
+            devices.push_back(MakeDevice(idx, name, "CD/DVD", 1));
         }
         return devices;
     }
 
     bool BurnISO(const std::string& isoPath, const std::string& devicePath,
                  const std::string& discType, int speed) override {
-        (void)devicePath;
-        (void)discType;
-        (void)speed;
+        (void)discType; /* drutil picks the media type from the loaded disc;
+                           it has no type-overwrite for `burn`. */
 
         if (IsBurnCancelled()) {
             SetBurnLastError("Burn cancelled by caller");
@@ -231,9 +270,24 @@ public:
         }
         NotifyProgressBurn(10, "Preparing to burn with drutil...");
 
-        std::vector<std::string> args = {
-            "drutil", "burn", "-noverify", "-eject", isoPath
-        };
+        std::vector<std::string> args = { "drutil", "burn", "-noverify", "-eject" };
+        /* drutil -speed takes a true multiplier (unlike IMAPI2/libburn,
+         * which count sectors/s and k/s), so no unit conversion here. */
+        if (speed > 0) {
+            char buf[16];
+            snprintf(buf, sizeof(buf), "%d", speed);
+            args.push_back("-speed");
+            args.push_back(buf);
+        }
+        /* ListDevices reports the drutil row index; select that drive when
+         * it is one. drutil only accepts digits, not paths, so plain digits
+         * guard. Empty or non-numeric devicePath keeps drutil's default. */
+        if (!devicePath.empty() &&
+            devicePath.find_first_not_of("0123456789") == std::string::npos) {
+            args.push_back("-drive");
+            args.push_back(devicePath);
+        }
+        args.push_back(isoPath);
 
         MacChildContext child;
         SetBurnCancelHook(MacCancelHook, &child);
@@ -291,6 +345,9 @@ public:
             return false;
         }
         if (rc != 0) {
+            /* hdiutil may leave a partial .iso behind; never hand a
+             * truncated image to the caller as "failed but usable". */
+            remove(isoPath.c_str());
             SetBurnLastError("hdiutil makehybrid failed: " + FailureDetail(output, rc));
             return false;
         }
