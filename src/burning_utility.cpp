@@ -1,5 +1,6 @@
 #include "burning_utility.h"
 #include "burn_internal.h"
+#include "media_format.h"
 #include <string>
 #include <vector>
 #include <memory>
@@ -22,12 +23,32 @@
 #include <sys/stat.h>
 #endif
 
-/* Thread-local error string and defaults. Defaults are read on the thread
- * that calls Burn_Start(), then snapshotted into the job. */
+/* The last-error string is per-thread (every exported function returns a
+ * pointer to a thread_local buffer - see GetLastErrorMessage). The default
+ * device / disc type / speed, however, are PROCESS-WIDE and guarded by a
+ * mutex: configuring them once on the startup thread must be visible to a
+ * worker thread that later calls Burn_Start() with a NULL device/discType.
+ * (Previously these were thread_local, so a background thread silently saw
+ * "no default device" and rejected the job - fixed here.) */
 static thread_local std::string g_lastError;
-static thread_local std::string g_defaultDevice = "";
-static thread_local std::string g_defaultDiscType = "CD-R";
-static thread_local int g_defaultSpeed = 4;
+
+static std::mutex g_configMutex;
+static std::string g_defaultDevice = "";
+static std::string g_defaultDiscType = "CD-R";
+static int g_defaultSpeed = 4;
+
+/* Copy the three process-wide defaults under the config mutex. Callers that
+ * must observe them together (Burn_Start) use this instead of reading the
+ * globals field-by-field. */
+struct DefaultConfig {
+    std::string device;
+    std::string discType;
+    int speed;
+};
+static DefaultConfig SnapshotDefaults() {
+    std::lock_guard<std::mutex> lk(g_configMutex);
+    return DefaultConfig{ g_defaultDevice, g_defaultDiscType, g_defaultSpeed };
+}
 
 /* The global progress callback is process-wide (jobs run on worker threads,
  * so a thread_local callback would never be visible to them). */
@@ -48,10 +69,15 @@ void SetBurnLastError(const std::string& error) {
     g_lastError = error;
 }
 
-/* Cross-platform temporary file path generation */
+/* Cross-platform temporary file path generation.
+ * The name embeds the process id, a per-process atomic counter and random
+ * digits: two concurrent DIRECTORY jobs must never land on the same path,
+ * or one job's TempIsoGuard deletes the other's in-flight image. */
 static std::string GenerateTempISOPath() {
     std::random_device rd;
     std::uniform_int_distribution<int> dist(100000, 999999);
+    static std::atomic<unsigned> s_seq{0};
+    const unsigned seq = s_seq.fetch_add(1);
 
 #if defined(_WIN32)
     char tempDir[MAX_PATH] = {0};
@@ -60,7 +86,8 @@ static std::string GenerateTempISOPath() {
         strncpy(tempDir, ".", sizeof(tempDir) - 1);
     }
     char buf[600];
-    snprintf(buf, sizeof(buf), "%s\\temp_burn_%d.iso", tempDir, dist(rd));
+    snprintf(buf, sizeof(buf), "%s\\temp_burn_%lu_%u_%d.iso",
+             tempDir, (unsigned long)GetCurrentProcessId(), seq, dist(rd));
     return std::string(buf);
 #else
     const char* tmpdir = getenv("TMPDIR");
@@ -68,7 +95,8 @@ static std::string GenerateTempISOPath() {
     if (!tmpdir) tmpdir = getenv("TMP");
     if (!tmpdir) tmpdir = "/tmp";
     char buf[600];
-    snprintf(buf, sizeof(buf), "%s/temp_burn_%d.iso", tmpdir, dist(rd));
+    snprintf(buf, sizeof(buf), "%s/temp_burn_%lu_%u_%d.iso",
+             tmpdir, (unsigned long)getpid(), seq, dist(rd));
     return std::string(buf);
 #endif
 }
@@ -82,6 +110,32 @@ static bool PathExists(const char* path) {
 #else
     struct stat st;
     return stat(path, &st) == 0;
+#endif
+}
+
+/* Resolve a (possibly relative) filesystem path to an absolute one.
+ *
+ * Motivation: libisofs' iso_tree_add_dir_rec() rejects relative source paths
+ * while IMAPI2's AddTree() accepts them, so the same CreateISO() call only
+ * worked with an absolute path on Linux. Normalising to absolute at the API
+ * boundary makes the behaviour identical on every backend. On failure we
+ * return the input unchanged so the backend produces its own precise error. */
+static std::string MakeAbsolutePath(const std::string& path) {
+    if (path.empty()) return path;
+#if defined(_WIN32)
+    char buf[4096];
+    DWORD n = GetFullPathNameA(path.c_str(), sizeof(buf), buf, nullptr);
+    if (n > 0 && n < sizeof(buf)) return std::string(buf);
+    return path;
+#else
+    if (path[0] == '/') return path;
+    char buf[4096];
+    if (getcwd(buf, sizeof(buf))) {
+        std::string base(buf);
+        if (!base.empty() && base.back() == '/') return base + path;
+        return base + "/" + path;
+    }
+    return path;
 #endif
 }
 
@@ -121,6 +175,21 @@ struct BurnJob {
     void* userData = nullptr;
     unsigned long long id = 0;
     unsigned long long startMs = 0;
+
+    /* ---- API version 3 request fields ---- */
+    int verifyLevel = BURN_VERIFY_NONE;
+    int leaveOpen = 0;
+    int fileSystems = 0;
+    int interchangeLevel = 0;
+    std::string bootImagePath;
+    int bootEmulation = BURN_BOOT_EMU_NONE;
+    int bootPlatform = BURN_BOOT_PLATFORM_X86;
+    int udfRevision = 0;
+    unsigned long long sessionStartBlock = 0;
+    int eraseFull = 0;
+    std::vector<BurnAudioTrackSpec> audioTracks;
+    std::string mediaCatalogNumber;
+    int startingTrackNumber = 1;
 
     mutable std::mutex mutex;
     std::condition_variable cv;
@@ -276,6 +345,96 @@ static void FireCancelHook(const std::shared_ptr<BurnJob>& job) {
     job->hookCv.notify_all();
 }
 
+/* ---------------------------------------------------------------------------
+ * Job mode helpers (v3)
+ * ------------------------------------------------------------------------- */
+namespace {
+
+bool ModeNeeds(int mode) { return mode >= BURN_JOB_MODE_IMAGE && mode <= BURN_JOB_MODE_BURN_RAW; }
+
+int CapabilityForMode(int mode) {
+    switch (mode) {
+    case BURN_JOB_MODE_IMAGE:        return BURN_CAP_IMAGE_BURN;
+    case BURN_JOB_MODE_DIRECTORY:    return BURN_CAP_CREATE_IMAGE;
+    case BURN_JOB_MODE_CREATE_IMAGE: return BURN_CAP_CREATE_IMAGE;
+    case BURN_JOB_MODE_AUDIO_TAO:    return BURN_CAP_AUDIO_TAO;
+    case BURN_JOB_MODE_ERASE:        return BURN_CAP_ERASE;
+    case BURN_JOB_MODE_APPEND:       return BURN_CAP_MULTISESSION;
+    case BURN_JOB_MODE_VERIFY:       return BURN_CAP_READBACK_VERIFY;
+    case BURN_JOB_MODE_CREATE_RAW:   return BURN_CAP_RAW_IMAGE;
+    case BURN_JOB_MODE_BURN_RAW:     return BURN_CAP_RAW_BURN;
+    default:                         return -1;
+    }
+}
+
+/* true when the mode must have a source path to be meaningful. */
+bool ModeNeedsSource(int mode) {
+    switch (mode) {
+    case BURN_JOB_MODE_IMAGE: case BURN_JOB_MODE_DIRECTORY:
+    case BURN_JOB_MODE_CREATE_IMAGE: case BURN_JOB_MODE_APPEND:
+    case BURN_JOB_MODE_VERIFY: case BURN_JOB_MODE_BURN_RAW:
+        return true;
+    default:
+        return false;
+    }
+}
+
+bool ModeNeedsOutput(int mode) {
+    return mode == BURN_JOB_MODE_CREATE_IMAGE || mode == BURN_JOB_MODE_CREATE_RAW;
+}
+
+bool ModeNeedsAudioTracks(int mode) {
+    return mode == BURN_JOB_MODE_AUDIO_TAO || mode == BURN_JOB_MODE_CREATE_RAW;
+}
+
+/* Copy the caller's fixed-size track array into owned std::strings. The
+ * header promises that Burn_Start() copies every string, so the job must
+ * not keep the caller's BurnAudioTrackC* alive. */
+std::vector<BurnAudioTrackSpec> CopyAudioTracks(const BurnAudioTrackC* src, int count) {
+    std::vector<BurnAudioTrackSpec> out;
+    if (!src || count <= 0) return out;
+    out.reserve((size_t)count);
+    for (int i = 0; i < count; ++i) {
+        BurnAudioTrackSpec t;
+        t.audioPath = src[i].audioPath;
+        t.isrc = src[i].isrc;
+        t.preemphasis = src[i].preemphasis;
+        out.push_back(t);
+    }
+    return out;
+}
+
+/* True when the path names a directory (the append/image decision hinges
+ * on this, so it must not be guessed from a file size). */
+static bool IsDirectoryPath(const std::string& path) {
+#if defined(_WIN32)
+    DWORD attr = GetFileAttributesA(path.c_str());
+    return attr != INVALID_FILE_ATTRIBUTES && (attr & FILE_ATTRIBUTE_DIRECTORY) != 0;
+#else
+    struct stat st;
+    return stat(path.c_str(), &st) == 0 && S_ISDIR(st.st_mode);
+#endif
+}
+
+/* Project the job request onto a backend image spec. */
+BurnImageSpec MakeImageSpec(const BurnJob& job) {
+    BurnImageSpec spec;
+    spec.sourcePath = job.sourcePath;
+    spec.outputPath = job.outputPath;
+    spec.volumeLabel = job.volumeLabel;
+    spec.fileSystems = job.fileSystems;
+    spec.interchangeLevel = job.interchangeLevel;
+    spec.bootImagePath = job.bootImagePath;
+    spec.bootEmulation = job.bootEmulation;
+    spec.bootPlatform = job.bootPlatform;
+    spec.udfRevision = job.udfRevision;
+    spec.sessionStartBlock = job.sessionStartBlock;
+    spec.devicePath = job.devicePath;
+    return spec;
+}
+
+} /* namespace */
+
 /* Remove the temporary ISO even when the worker body throws. */
 struct TempIsoGuard {
     std::string path;
@@ -303,18 +462,82 @@ static int RunJobBody(BurnJob& job) {
     }
 
     job.SetPhase("validating");
-    NotifyProgressBurn(2, "Validating source...");
+    NotifyProgressBurn(2, "Validating request...");
     if (IsBurnCancelled()) return BURN_ERROR_CANCELLED;
-
-    if (job.sourcePath.empty() || !PathExists(job.sourcePath.c_str())) {
-        SetBurnLastError("Source path not found: " + job.sourcePath);
-        return BURN_ERROR_INVALID_PARAM;
-    }
 
     IPlatform* platform = GetPlatform();
     if (!platform) {
         SetBurnLastError("Failed to create platform implementation");
         return BURN_ERROR_UNSUPPORTED_FORMAT;
+    }
+
+    /* Ask the backend before touching any media: a job started in an
+     * extended mode on a platform that cannot do it should fail here, not
+     * half-way through. Baseline modes (0..3) are not gated because the
+     * default Capability() answers 0 for everything, including the
+     * features every backend does implement. */
+    if (job.mode >= BURN_JOB_MODE_AUDIO_TAO && job.mode <= BURN_JOB_MODE_BURN_RAW) {
+        if (!platform->Capability(CapabilityForMode(job.mode))) {
+            SetBurnLastError("This job mode is not implemented by the platform backend");
+            return BURN_ERROR_UNSUPPORTED_FORMAT;
+        }
+    }
+    /* Options that need a capability of their own even inside a baseline
+     * mode: a plain CREATE_IMAGE works everywhere, asking for UDF or a
+     * boot catalog does not. */
+    if (!job.bootImagePath.empty() && !platform->Capability(BURN_CAP_BOOT_IMAGE)) {
+        SetBurnLastError("El Torito boot images are not implemented by the platform backend");
+        return BURN_ERROR_UNSUPPORTED_FORMAT;
+    }
+    if ((job.fileSystems & BURN_FS_UDF) && !platform->Capability(BURN_CAP_UDF)) {
+        SetBurnLastError("UDF images are not implemented by the platform backend");
+        return BURN_ERROR_UNSUPPORTED_FORMAT;
+    }
+    if (job.verifyLevel == BURN_VERIFY_FULL && !platform->Capability(BURN_CAP_READBACK_VERIFY)) {
+        SetBurnLastError("Byte-level read-back verification is not implemented by the "
+                         "platform backend");
+        return BURN_ERROR_UNSUPPORTED_FORMAT;
+    }
+
+    if (ModeNeedsSource(job.mode) &&
+        (job.sourcePath.empty() || !PathExists(job.sourcePath.c_str()))) {
+        SetBurnLastError("Source path not found: " + job.sourcePath);
+        return BURN_ERROR_INVALID_PARAM;
+    }
+
+    /* Normalise to absolute so every backend sees the same form. libisofs
+     * rejects relative source paths while IMAPI2 accepts them, which made an
+     * identical CreateISO() call succeed on Windows and fail on Linux.
+     * The output path is normalised too (it normally does not exist yet). */
+    if (!job.sourcePath.empty()) job.sourcePath = MakeAbsolutePath(job.sourcePath);
+    if (!job.outputPath.empty()) job.outputPath = MakeAbsolutePath(job.outputPath);
+    if (!job.bootImagePath.empty()) job.bootImagePath = MakeAbsolutePath(job.bootImagePath);
+
+    if (ModeNeedsAudioTracks(job.mode)) {
+        for (size_t i = 0; i < job.audioTracks.size(); ++i) {
+            BurnAudioTrackSpec& t = job.audioTracks[i];
+            t.audioPath = MakeAbsolutePath(t.audioPath);
+            if (!PathExists(t.audioPath.c_str())) {
+                SetBurnLastError("Audio track " + std::to_string((int)i + 1) +
+                                 " not found: " + t.audioPath);
+                return BURN_ERROR_INVALID_PARAM;
+            }
+            /* Reject a bad geometry up front: writing it would waste a
+             * blank disc on audio that plays at the wrong speed. */
+            burn_media::AudioPayload p = burn_media::Probe(t.audioPath);
+            if (!p.ok) {
+                SetBurnLastError(p.error.empty() ? "Unreadable audio track: " + t.audioPath
+                                                 : p.error);
+                return BURN_ERROR_INVALID_PARAM;
+            }
+        }
+    }
+
+    if (job.mode != BURN_JOB_MODE_CREATE_IMAGE &&
+        job.mode != BURN_JOB_MODE_CREATE_RAW &&
+        job.devicePath.empty()) {
+        SetBurnLastError("No burning device specified");
+        return BURN_ERROR_DEVICE_NOT_FOUND;
     }
 
     if (job.mode == BURN_JOB_MODE_CREATE_IMAGE) {
@@ -323,18 +546,69 @@ static int RunJobBody(BurnJob& job) {
             return BURN_ERROR_INVALID_PARAM;
         }
         job.SetPhase("creating-image");
-        NotifyProgressBurn(5, "Creating ISO image...");
+        NotifyProgressBurn(5, "Creating image...");
         if (IsBurnCancelled()) return BURN_ERROR_CANCELLED;
-        if (!platform->CreateISO(job.sourcePath, job.outputPath, job.volumeLabel)) {
+        BurnImageSpec spec = MakeImageSpec(job);
+        if (!platform->CreateImage(spec)) {
             return BURN_ERROR_ISO_CREATION_FAILED;
         }
-        NotifyProgressBurn(100, "ISO creation completed");
+        NotifyProgressBurn(100, "Image creation completed");
         return BURN_SUCCESS;
     }
 
-    if (job.devicePath.empty()) {
-        SetBurnLastError("No burning device specified");
-        return BURN_ERROR_DEVICE_NOT_FOUND;
+    if (job.mode == BURN_JOB_MODE_CREATE_RAW) {
+        if (job.outputPath.empty()) {
+            SetBurnLastError("Output RAW image path is required");
+            return BURN_ERROR_INVALID_PARAM;
+        }
+        job.SetPhase("creating-raw-image");
+        NotifyProgressBurn(5, "Building RAW PQ image...");
+        if (IsBurnCancelled()) return BURN_ERROR_CANCELLED;
+        if (!platform->CreateRawImage(job.audioTracks, job.outputPath,
+                                      job.mediaCatalogNumber,
+                                      job.startingTrackNumber)) {
+            return BURN_ERROR_ISO_CREATION_FAILED;
+        }
+        NotifyProgressBurn(100, "RAW image creation completed");
+        return BURN_SUCCESS;
+    }
+
+    if (job.mode == BURN_JOB_MODE_ERASE) {
+        job.SetPhase("erasing");
+        NotifyProgressBurn(5, "Erasing / formatting media...");
+        if (IsBurnCancelled()) return BURN_ERROR_CANCELLED;
+        if (!platform->EraseDisc(job.devicePath, job.eraseFull != 0)) {
+            return BURN_ERROR_BURN_FAILED;
+        }
+        NotifyProgressBurn(100, "Erase completed");
+        return BURN_SUCCESS;
+    }
+
+    if (job.mode == BURN_JOB_MODE_AUDIO_TAO) {
+        job.SetPhase("burning-audio");
+        NotifyProgressBurn(3, "Preparing audio session...");
+        if (IsBurnCancelled()) return BURN_ERROR_CANCELLED;
+        if (!platform->BurnAudioTracks(job.audioTracks, job.devicePath, job.speed,
+                                       job.verifyLevel, job.leaveOpen == 0)) {
+            if (IsBurnCancelled()) return BURN_ERROR_CANCELLED;
+            return BURN_ERROR_BURN_FAILED;
+        }
+        NotifyProgressBurn(100, "Audio session completed");
+        return BURN_SUCCESS;
+    }
+
+    if (job.mode == BURN_JOB_MODE_VERIFY) {
+        job.SetPhase("verifying");
+        NotifyProgressBurn(3, "Reading back written data...");
+        if (IsBurnCancelled()) return BURN_ERROR_CANCELLED;
+        int level = job.verifyLevel == BURN_VERIFY_NONE ? BURN_VERIFY_FULL : job.verifyLevel;
+        if (!platform->VerifyWrite(job.devicePath, job.sourcePath, level)) {
+            if (IsBurnCancelled()) return BURN_ERROR_CANCELLED;
+            /* Last-error carries the sector-accurate reason. */
+            return BURN_ERROR_BURN_FAILED;
+        }
+        NotifyProgressBurn(100, "Verification completed");
+        return BURN_SUCCESS;
     }
 
     std::string isoPath = job.sourcePath;
@@ -343,7 +617,10 @@ static int RunJobBody(BurnJob& job) {
         temp.path = GenerateTempISOPath();
         job.SetProgressRange(0, 40);
         job.SetPhase("creating-image");
-        if (!platform->CreateISO(job.sourcePath, temp.path, job.volumeLabel)) {
+        if (IsBurnCancelled()) return BURN_ERROR_CANCELLED;
+        BurnImageSpec spec = MakeImageSpec(job);
+        spec.outputPath = temp.path;
+        if (!platform->CreateImage(spec)) {
             return BURN_ERROR_ISO_CREATION_FAILED;
         }
         isoPath = temp.path;
@@ -353,9 +630,58 @@ static int RunJobBody(BurnJob& job) {
 
     job.SetPhase("burning");
     if (IsBurnCancelled()) return BURN_ERROR_CANCELLED;
-    bool burned = platform->BurnISO(isoPath, job.devicePath, job.discType, job.speed);
-    if (IsBurnCancelled()) return BURN_ERROR_CANCELLED;
-    if (!burned) return BURN_ERROR_BURN_FAILED;
+
+    bool burned;
+    if (job.mode == BURN_JOB_MODE_BURN_RAW) {
+        burned = platform->BurnRawImage(isoPath, job.devicePath, job.speed,
+                                       job.verifyLevel);
+    } else {
+        /* IMAGE / DIRECTORY / APPEND share one entry point that also carries
+         * the v3 write options. A first-session closed write without
+         * verification is exactly the legacy BurnISO(). */
+        long long sbbSigned = (long long)job.sessionStartBlock;
+        if (job.mode == BURN_JOB_MODE_APPEND && sbbSigned == 0) {
+            /* Not supplied: ask the drive where the next session starts. */
+            sbbSigned = platform->NextSessionStartBlock(job.devicePath);
+            if (sbbSigned < 0) {
+                if (sbbSigned == -2) {
+                    SetBurnLastError("This platform backend cannot inquire session addresses");
+                    return BURN_ERROR_UNSUPPORTED_FORMAT;
+                }
+                SetBurnLastError("Append requires an appendable disc; the drive reported "
+                                 "no free session (blank media takes mode DIRECTORY instead)");
+                return BURN_ERROR_BURN_FAILED;
+            }
+        }
+        const unsigned long long sbb = sbbSigned > 0 ? (unsigned long long)sbbSigned : 0ULL;
+
+        if (job.mode == BURN_JOB_MODE_APPEND && IsDirectoryPath(job.sourcePath)) {
+            /* A directory source means the caller wants the continuation
+             * session's image built for that LBA first. */
+            temp.path = GenerateTempISOPath();
+            job.SetPhase("creating-image");
+            BurnImageSpec spec = MakeImageSpec(job);
+            spec.outputPath = temp.path;
+            spec.sessionStartBlock = sbb;
+            if (!platform->CreateImage(spec)) {
+                return BURN_ERROR_ISO_CREATION_FAILED;
+            }
+            isoPath = temp.path;
+            if (IsBurnCancelled()) return BURN_ERROR_CANCELLED;
+            job.SetPhase("burning");
+        }
+        burned = platform->BurnImageFile(isoPath, job.devicePath, job.discType,
+                                         job.speed, job.verifyLevel,
+                                         job.leaveOpen == 0, sbb);
+    }
+    /* Result first, late cancellation second: a cancel that lands while the
+     * drive is finishing its last sectors must not downgrade a completely
+     * written disc to CANCELLED - the caller would skip verifying good
+     * media. The backends apply the same rule at their own level. */
+    if (!burned) {
+        if (IsBurnCancelled()) return BURN_ERROR_CANCELLED;
+        return BURN_ERROR_BURN_FAILED;
+    }
 
     NotifyProgressBurn(100, "Burn completed");
     return BURN_SUCCESS;
@@ -571,15 +897,31 @@ int VerifyDisc(const char* devicePath, const char* isoPath) {
         }
         fseek(isoFile, 0, SEEK_END);
         long isoSize = ftell(isoFile);
+        /* Pre-flight check of the image we were asked to compare against. */
+        char probe[4];
+        fseek(isoFile, 0, SEEK_SET);
+        size_t got = fread(probe, 1, sizeof(probe), isoFile);
         fclose(isoFile);
         if (isoSize <= 0) {
             SetBurnLastError("ISO file is empty");
             return BURN_ERROR_ISO_CREATION_FAILED;
         }
-        NotifyLegacyProgress(50, "Verifying disc...");
-        NotifyLegacyProgress(100, "Verification completed (basic check)");
-        /* TODO: byte-level read-back verification (needs platform read support). */
-        return BURN_SUCCESS;
+        NotifyLegacyProgress(50, "Validating image file...");
+
+        /* Honest return: no byte-level read-back was performed.
+         *
+         * IMAPI2 has no disc-read interface at all, and libburn's read APIs
+         * are not wired into this library, so there is no backend that can
+         * read a track back off the medium. Returning BURN_SUCCESS here used
+         * to report "verified" after only having stat()ed the ISO file,
+         * which is indistinguishable from a real verification to callers
+         * checking for 0. Callers that need integrity assurance must compare
+         * a hash they read themselves (for example by mounting the disc). */
+        (void)got;
+        SetBurnLastError(
+            "Disc read-back verification is not implemented on this platform; "
+            "the ISO file was checked but the disc contents were not read");
+        return BURN_ERROR_UNSUPPORTED_FORMAT;
     } catch (const std::exception& e) {
         SetBurnLastError(std::string("Internal exception: ") + e.what());
         return BURN_ERROR_EXCEPTION;
@@ -638,11 +980,16 @@ int GetDefaultDevice(char* devicePath, int bufferSize) {
         if (!devicePath || bufferSize <= 0) {
             return BURN_ERROR_INVALID_PARAM;
         }
-        if (g_defaultDevice.empty()) {
+        std::string device;
+        {
+            std::lock_guard<std::mutex> lk(g_configMutex);
+            device = g_defaultDevice;
+        }
+        if (device.empty()) {
             devicePath[0] = '\0';
             return BURN_ERROR_DEVICE_NOT_FOUND;
         }
-        strncpy(devicePath, g_defaultDevice.c_str(), bufferSize - 1);
+        strncpy(devicePath, device.c_str(), bufferSize - 1);
         devicePath[bufferSize - 1] = '\0';
         return BURN_SUCCESS;
     } catch (...) {
@@ -705,7 +1052,10 @@ int ValidateSourcePath(const char* path) {
 
 void SetDefaultDevice(const char* device) {
     try {
-        if (device) g_defaultDevice = device;
+        if (device) {
+            std::lock_guard<std::mutex> lk(g_configMutex);
+            g_defaultDevice = device;
+        }
     } catch (...) {
         SetBurnLastError("Internal exception (unknown type)");
     }
@@ -713,7 +1063,10 @@ void SetDefaultDevice(const char* device) {
 
 void SetDefaultDiscType(const char* discType) {
     try {
-        if (discType) g_defaultDiscType = discType;
+        if (discType) {
+            std::lock_guard<std::mutex> lk(g_configMutex);
+            g_defaultDiscType = discType;
+        }
     } catch (...) {
         SetBurnLastError("Internal exception (unknown type)");
     }
@@ -721,7 +1074,10 @@ void SetDefaultDiscType(const char* discType) {
 
 void SetDefaultSpeed(int speed) {
     try {
-        if (speed > 0) g_defaultSpeed = speed;
+        if (speed > 0) {
+            std::lock_guard<std::mutex> lk(g_configMutex);
+            g_defaultSpeed = speed;
+        }
     } catch (...) {
         SetBurnLastError("Internal exception (unknown type)");
     }
@@ -735,40 +1091,108 @@ BurnJobHandle Burn_Start(const BurnJobOptions* options) {
             SetBurnLastError("Burn_Start: options must not be NULL");
             return BURN_INVALID_JOB_HANDLE;
         }
-        if (options->size != (int)sizeof(BurnJobOptions)) {
-            SetBurnLastError("Burn_Start: set options.size to sizeof(BurnJobOptions)");
+        /* Two struct versions share a prefix: dispatch on `size`. */
+        const bool v3 = options->size == (int)sizeof(BurnJobOptions3);
+        if (options->size != (int)sizeof(BurnJobOptions) && !v3) {
+            SetBurnLastError("Burn_Start: set options.size to sizeof(BurnJobOptions) "
+                             "or sizeof(BurnJobOptions3)");
             return BURN_INVALID_JOB_HANDLE;
         }
-        if (options->mode < BURN_JOB_MODE_IMAGE || options->mode > BURN_JOB_MODE_SELFTEST) {
+        const BurnJobOptions3* o3 = v3 ? reinterpret_cast<const BurnJobOptions3*>(options) : nullptr;
+
+        if (!ModeNeeds(options->mode)) {
             SetBurnLastError("Burn_Start: unknown job mode");
             return BURN_INVALID_JOB_HANDLE;
         }
-        if (options->mode != BURN_JOB_MODE_SELFTEST &&
+        if (ModeNeedsSource(options->mode) &&
             (!options->sourcePath || !options->sourcePath[0])) {
-            SetBurnLastError("Burn_Start: sourcePath is required");
+            SetBurnLastError("Burn_Start: sourcePath is required for this job mode");
             return BURN_INVALID_JOB_HANDLE;
         }
-        if (options->mode == BURN_JOB_MODE_CREATE_IMAGE &&
+        if (ModeNeedsOutput(options->mode) &&
             (!options->outputPath || !options->outputPath[0])) {
-            SetBurnLastError("Burn_Start: outputPath is required for CREATE_IMAGE");
+            SetBurnLastError("Burn_Start: outputPath is required for this job mode");
             return BURN_INVALID_JOB_HANDLE;
+        }
+        if (v3) {
+            if (ModeNeedsAudioTracks(options->mode)) {
+                if (!o3->audioTracks || o3->audioTrackCount <= 0) {
+                    SetBurnLastError("Burn_Start: audioTracks/audioTrackCount are required "
+                                     "for this job mode");
+                    return BURN_INVALID_JOB_HANDLE;
+                }
+                if (o3->audioTrackCount > 99) {
+                    SetBurnLastError("Burn_Start: a CD holds at most 99 tracks");
+                    return BURN_INVALID_JOB_HANDLE;
+                }
+            }
+            if (o3->audioTrackCount > 0 && !ModeNeedsAudioTracks(options->mode)) {
+                SetBurnLastError("Burn_Start: audioTracks given for a mode that does not use them");
+                return BURN_INVALID_JOB_HANDLE;
+            }
+            if (o3->interchangeLevel != 0 &&
+                (o3->interchangeLevel < 1 || o3->interchangeLevel > 3)) {
+                SetBurnLastError("Burn_Start: interchangeLevel must be 1..3 or 0");
+                return BURN_INVALID_JOB_HANDLE;
+            }
+            if (o3->fileSystems & ~(BURN_FS_ISO9660 | BURN_FS_JOLIET | BURN_FS_UDF)) {
+                SetBurnLastError("Burn_Start: fileSystems contains unknown BURN_FS_* bits");
+                return BURN_INVALID_JOB_HANDLE;
+            }
+            if (o3->bootEmulation < BURN_BOOT_EMU_NONE || o3->bootEmulation > BURN_BOOT_EMU_HARDDISK) {
+                SetBurnLastError("Burn_Start: bootEmulation must be BURN_BOOT_EMU_*");
+                return BURN_INVALID_JOB_HANDLE;
+            }
+            if (o3->verifyLevel < BURN_VERIFY_NONE || o3->verifyLevel > BURN_VERIFY_FULL) {
+                SetBurnLastError("Burn_Start: verifyLevel must be BURN_VERIFY_*");
+                return BURN_INVALID_JOB_HANDLE;
+            }
+            if (o3->startingTrackNumber != 0 &&
+                (o3->startingTrackNumber < 1 || o3->startingTrackNumber > 99)) {
+                SetBurnLastError("Burn_Start: startingTrackNumber must be 1..99 or 0");
+                return BURN_INVALID_JOB_HANDLE;
+            }
         }
 
         std::shared_ptr<BurnJob> job = std::make_shared<BurnJob>();
+        const DefaultConfig cfg = SnapshotDefaults();
         job->mode = options->mode;
         job->sourcePath = options->sourcePath ? options->sourcePath : "";
         job->outputPath = options->outputPath ? options->outputPath : "";
         job->devicePath = options->devicePath ? options->devicePath : "";
         job->discType = options->discType ? options->discType : "";
         job->volumeLabel = options->volumeLabel ? options->volumeLabel : "";
-        if (job->devicePath.empty()) job->devicePath = g_defaultDevice;
-        if (job->discType.empty()) job->discType = g_defaultDiscType;
+        if (job->devicePath.empty()) job->devicePath = cfg.device;
+        if (job->discType.empty()) job->discType = cfg.discType;
         if (job->volumeLabel.empty()) job->volumeLabel = "DISC";
-        job->speed = options->speed > 0 ? options->speed : g_defaultSpeed;
+        job->speed = options->speed > 0 ? options->speed : cfg.speed;
         job->verify = options->verify;
         job->callback = options->progressCallback;
         job->userData = options->userData;
         job->startMs = NowMs();
+
+        if (v3) {
+            /* A legacy verify=1 request means "verify", not "level 1"
+             * only when verifyLevel was left at zero. */
+            job->verifyLevel = o3->verifyLevel;
+            if (job->verifyLevel == BURN_VERIFY_NONE && o3->verify > 0) {
+                job->verifyLevel = BURN_VERIFY_QUICK;
+            }
+            job->leaveOpen = o3->leaveOpen ? 1 : 0;
+            job->fileSystems = o3->fileSystems;
+            job->interchangeLevel = o3->interchangeLevel;
+            job->bootImagePath = o3->bootImagePath ? o3->bootImagePath : "";
+            job->bootEmulation = o3->bootEmulation;
+            job->bootPlatform = o3->bootPlatform;
+            job->udfRevision = o3->udfRevision;
+            job->sessionStartBlock = o3->sessionStartBlock;
+            job->eraseFull = o3->eraseFull ? 1 : 0;
+            job->audioTracks = CopyAudioTracks(o3->audioTracks, o3->audioTrackCount);
+            job->mediaCatalogNumber = o3->mediaCatalogNumber ? o3->mediaCatalogNumber : "";
+            job->startingTrackNumber = o3->startingTrackNumber > 0 ? o3->startingTrackNumber : 1;
+        } else if (job->verify > 0) {
+            job->verifyLevel = BURN_VERIFY_QUICK;
+        }
 
         unsigned long long id = 0;
         {
@@ -985,6 +1409,299 @@ int Burn_GetActiveJobCount(void) {
 
 int Burn_GetApiVersion(void) {
     return BURN_API_VERSION;
+}
+
+/* ---- API version 3: capability discovery and the extended surface ---- */
+
+int Burn_GetCapability(int capability) {
+    try {
+        IPlatform* platform = GetPlatform();
+        if (!platform) return 0;
+        /* The two baseline features are implemented by every backend in
+         * this library, so answer them here instead of relying on an
+         * override that exists for that purpose. */
+        if (capability == BURN_CAP_IMAGE_BURN || capability == BURN_CAP_CREATE_IMAGE) {
+            return 1;
+        }
+        int v = platform->Capability(capability);
+        return v ? 1 : 0;
+    } catch (...) {
+        return 0;
+    }
+}
+
+long long Burn_GetNextSessionBlock(const char* devicePath) {
+    try {
+        if (!devicePath || !devicePath[0]) {
+            SetBurnLastError("Burn_GetNextSessionBlock: devicePath is required");
+            return BURN_ERROR_INVALID_PARAM;
+        }
+        IPlatform* platform = GetPlatform();
+        if (!platform) {
+            SetBurnLastError("Failed to create platform implementation");
+            return BURN_ERROR_UNSUPPORTED_FORMAT;
+        }
+        return platform->NextSessionStartBlock(devicePath);
+    } catch (const std::exception& e) {
+        SetBurnLastError(std::string("Internal exception: ") + e.what());
+        return BURN_ERROR_EXCEPTION;
+    } catch (...) {
+        SetBurnLastError("Internal exception (unknown type)");
+        return BURN_ERROR_EXCEPTION;
+    }
+}
+
+int BurnEjectTray(const char* devicePath) {
+    try {
+        if (!devicePath || !devicePath[0]) {
+            SetBurnLastError("BurnEjectTray: devicePath is required");
+            return BURN_ERROR_INVALID_PARAM;
+        }
+        IPlatform* platform = GetPlatform();
+        if (!platform) return BURN_ERROR_UNSUPPORTED_FORMAT;
+        return platform->EjectTray(devicePath);
+    } catch (...) {
+        SetBurnLastError("Internal exception (unknown type)");
+        return BURN_ERROR_EXCEPTION;
+    }
+}
+
+int BurnCloseTray(const char* devicePath) {
+    try {
+        if (!devicePath || !devicePath[0]) {
+            SetBurnLastError("BurnCloseTray: devicePath is required");
+            return BURN_ERROR_INVALID_PARAM;
+        }
+        IPlatform* platform = GetPlatform();
+        if (!platform) return BURN_ERROR_UNSUPPORTED_FORMAT;
+        return platform->CloseTray(devicePath);
+    } catch (...) {
+        SetBurnLastError("Internal exception (unknown type)");
+        return BURN_ERROR_EXCEPTION;
+    }
+}
+
+const char* Burn_GetDriveInformation(const char* devicePath) {
+    static thread_local std::string result;
+    try {
+        if (!devicePath || !devicePath[0]) {
+            SetBurnLastError("Burn_GetDriveInformation: devicePath is required");
+            result.clear();
+            return result.c_str();
+        }
+        IPlatform* platform = GetPlatform();
+        if (!platform) {
+            result.clear();
+            return result.c_str();
+        }
+        result = platform->DriveInformation(devicePath);
+        return result.c_str();
+    } catch (...) {
+        result.clear();
+        return result.c_str();
+    }
+}
+
+namespace {
+
+/* Shared plumbing for the synchronous v3 convenience wrappers: build a
+ * BurnJobOptions3, run it to completion through the job engine (so all of
+ * them get the same cancellation, progress and error semantics), and hand
+ * back the job's errorCode. */
+int RunV3Simple(BurnJobOptions3* o, BurnJobStatus* outStatus) {
+    o->size = (int)sizeof(BurnJobOptions3);
+    return Burn_Simple(reinterpret_cast<const BurnJobOptions*>(o), outStatus);
+}
+
+} /* namespace */
+
+int BurnAudioCd(const char* const* wavPaths, int trackCount,
+                const char* devicePath, int speed, int verifyLevel) {
+    try {
+        if (!devicePath || !devicePath[0]) {
+            SetBurnLastError("BurnAudioCd: devicePath is required");
+            return BURN_ERROR_INVALID_PARAM;
+        }
+        if (!wavPaths || trackCount <= 0 || trackCount > 99) {
+            SetBurnLastError("BurnAudioCd: wavPaths and a trackCount of 1..99 are required");
+            return BURN_ERROR_INVALID_PARAM;
+        }
+        /* BurnAudioTrackC uses fixed 512-byte slots; reject an over-long
+         * path rather than silently truncating to a missing file. */
+        std::vector<BurnAudioTrackC> tracks((size_t)trackCount);
+        for (int i = 0; i < trackCount; ++i) {
+            const char* p = wavPaths[i];
+            if (!p || !p[0]) {
+                SetBurnLastError("BurnAudioCd: track " + std::to_string(i + 1) +
+                                 " has a NULL path");
+                return BURN_ERROR_INVALID_PARAM;
+            }
+            if (std::strlen(p) >= sizeof(tracks[0].audioPath)) {
+                SetBurnLastError("BurnAudioCd: track path is longer than 511 characters");
+                return BURN_ERROR_INVALID_PARAM;
+            }
+            std::memcpy(tracks[(size_t)i].audioPath, p, std::strlen(p) + 1);
+            tracks[(size_t)i].isrc[0] = '\0';
+            tracks[(size_t)i].preemphasis = 0;
+        }
+
+        BurnJobOptions3 o;
+        std::memset(&o, 0, sizeof(o));
+        o.mode = BURN_JOB_MODE_AUDIO_TAO;
+        o.devicePath = devicePath;
+        o.speed = speed;
+        o.verifyLevel = verifyLevel;
+        o.audioTracks = tracks.data();
+        o.audioTrackCount = trackCount;
+        return RunV3Simple(&o, nullptr);
+    } catch (const std::exception& e) {
+        SetBurnLastError(std::string("Internal exception: ") + e.what());
+        return BURN_ERROR_EXCEPTION;
+    } catch (...) {
+        SetBurnLastError("Internal exception (unknown type)");
+        return BURN_ERROR_EXCEPTION;
+    }
+}
+
+int BurnEraseDisc(const char* devicePath, int fullErase) {
+    try {
+        if (!devicePath || !devicePath[0]) {
+            SetBurnLastError("BurnEraseDisc: devicePath is required");
+            return BURN_ERROR_INVALID_PARAM;
+        }
+        BurnJobOptions3 o;
+        std::memset(&o, 0, sizeof(o));
+        o.mode = BURN_JOB_MODE_ERASE;
+        o.devicePath = devicePath;
+        o.eraseFull = fullErase;
+        return RunV3Simple(&o, nullptr);
+    } catch (const std::exception& e) {
+        SetBurnLastError(std::string("Internal exception: ") + e.what());
+        return BURN_ERROR_EXCEPTION;
+    } catch (...) {
+        SetBurnLastError("Internal exception (unknown type)");
+        return BURN_ERROR_EXCEPTION;
+    }
+}
+
+int BurnAppendSession(const char* sourceDir, const char* devicePath,
+                      const char* volumeLabel, int speed,
+                      unsigned long long sessionStartBlock,
+                      int leaveOpen) {
+    try {
+        if (!sourceDir || !sourceDir[0]) {
+            SetBurnLastError("BurnAppendSession: sourceDir is required");
+            return BURN_ERROR_INVALID_PARAM;
+        }
+        BurnJobOptions3 o;
+        std::memset(&o, 0, sizeof(o));
+        o.mode = BURN_JOB_MODE_APPEND;
+        o.sourcePath = sourceDir;
+        o.devicePath = devicePath;
+        o.volumeLabel = volumeLabel;
+        o.speed = speed;
+        o.sessionStartBlock = sessionStartBlock;
+        o.leaveOpen = leaveOpen;
+        return RunV3Simple(&o, nullptr);
+    } catch (const std::exception& e) {
+        SetBurnLastError(std::string("Internal exception: ") + e.what());
+        return BURN_ERROR_EXCEPTION;
+    } catch (...) {
+        SetBurnLastError("Internal exception (unknown type)");
+        return BURN_ERROR_EXCEPTION;
+    }
+}
+
+/* Byte-level read-back of a written disc against its source image. This is
+ * the real verification VerifyDisc() could not offer; check
+ * BURN_CAP_READBACK_VERIFY first. level: BURN_VERIFY_QUICK / _FULL. */
+int Burn_VerifyWrite(const char* devicePath, const char* expectedImagePath, int level) {
+    try {
+        if (!devicePath || !devicePath[0] || !expectedImagePath || !expectedImagePath[0]) {
+            SetBurnLastError("Burn_VerifyWrite: devicePath and expectedImagePath are required");
+            return BURN_ERROR_INVALID_PARAM;
+        }
+        if (level != BURN_VERIFY_QUICK && level != BURN_VERIFY_FULL) {
+            SetBurnLastError("Burn_VerifyWrite: level must be BURN_VERIFY_QUICK or BURN_VERIFY_FULL");
+            return BURN_ERROR_INVALID_PARAM;
+        }
+        BurnJobOptions3 o;
+        std::memset(&o, 0, sizeof(o));
+        o.mode = BURN_JOB_MODE_VERIFY;
+        o.sourcePath = expectedImagePath;
+        o.devicePath = devicePath;
+        o.verifyLevel = level;
+        return RunV3Simple(&o, nullptr);
+    } catch (const std::exception& e) {
+        SetBurnLastError(std::string("Internal exception: ") + e.what());
+        return BURN_ERROR_EXCEPTION;
+    } catch (...) {
+        SetBurnLastError("Internal exception (unknown type)");
+        return BURN_ERROR_EXCEPTION;
+    }
+}
+
+/* RAW PQ image building (drive-free) and RAW writing. */
+int BurnCreateRawImage(const char* const* wavPaths, int trackCount,
+                       const char* outputPath, const char* mediaCatalogNumber,
+                       int startingTrackNumber) {
+    try {
+        if (!wavPaths || trackCount <= 0 || trackCount > 99 ||
+            !outputPath || !outputPath[0]) {
+            SetBurnLastError("BurnCreateRawImage: wavPaths (1..99) and outputPath are required");
+            return BURN_ERROR_INVALID_PARAM;
+        }
+        std::vector<BurnAudioTrackC> tracks((size_t)trackCount);
+        for (int i = 0; i < trackCount; ++i) {
+            const char* p = wavPaths[i];
+            if (!p || std::strlen(p) >= sizeof(tracks[0].audioPath)) {
+                SetBurnLastError("BurnCreateRawImage: invalid track path");
+                return BURN_ERROR_INVALID_PARAM;
+            }
+            std::memcpy(tracks[(size_t)i].audioPath, p, std::strlen(p) + 1);
+            tracks[(size_t)i].isrc[0] = '\0';
+            tracks[(size_t)i].preemphasis = 0;
+        }
+        BurnJobOptions3 o;
+        std::memset(&o, 0, sizeof(o));
+        o.mode = BURN_JOB_MODE_CREATE_RAW;
+        o.outputPath = outputPath;
+        o.audioTracks = tracks.data();
+        o.audioTrackCount = trackCount;
+        o.mediaCatalogNumber = mediaCatalogNumber;
+        o.startingTrackNumber = startingTrackNumber;
+        return RunV3Simple(&o, nullptr);
+    } catch (const std::exception& e) {
+        SetBurnLastError(std::string("Internal exception: ") + e.what());
+        return BURN_ERROR_EXCEPTION;
+    } catch (...) {
+        SetBurnLastError("Internal exception (unknown type)");
+        return BURN_ERROR_EXCEPTION;
+    }
+}
+
+int BurnRawImageToDisc(const char* rawImagePath, const char* devicePath,
+                       int speed, int verifyLevel) {
+    try {
+        if (!rawImagePath || !rawImagePath[0]) {
+            SetBurnLastError("BurnRawImageToDisc: rawImagePath is required");
+            return BURN_ERROR_INVALID_PARAM;
+        }
+        BurnJobOptions3 o;
+        std::memset(&o, 0, sizeof(o));
+        o.mode = BURN_JOB_MODE_BURN_RAW;
+        o.sourcePath = rawImagePath;
+        o.devicePath = devicePath;
+        o.speed = speed;
+        o.verifyLevel = verifyLevel;
+        return RunV3Simple(&o, nullptr);
+    } catch (const std::exception& e) {
+        SetBurnLastError(std::string("Internal exception: ") + e.what());
+        return BURN_ERROR_EXCEPTION;
+    } catch (...) {
+        SetBurnLastError("Internal exception (unknown type)");
+        return BURN_ERROR_EXCEPTION;
+    }
 }
 
 } /* extern "C" */
