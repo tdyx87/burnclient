@@ -42,7 +42,8 @@ static void printUsage() {
               << "  create-iso <src> <iso> [label]   Create ISO from directory\n"
               << "  burn-iso <iso> <device> [type] [speed]  Burn ISO to device\n"
               << "  burn-dir <src> <device> [type] [speed] Burn directory to device\n"
-              << "  verify <device> <iso>     Verify disc\n"
+              << "  verify <device> <iso> [quick|full]  Read the disc back and\n"
+              << "                            compare it with the image\n"
               << "  burn-job <iso> <device> [type] [speed]  Async burn with live status\n"
               << "  job-selftest [cancel]     Diagnostic job, optionally cancelled\n"
               << "  burn-test                 Integration test: burn a generated ISO\n"
@@ -153,9 +154,15 @@ int main(int argc, char* argv[]) {
         return ok ? 0 : 1;
     }
     if (cmd == "verify" && argc >= 4) {
-        bool ok = util.VerifyDisc(argv[2], argv[3]);
-        std::cout << (ok ? "OK" : "FAILED: " + util.GetLastErrorMessage()) << "\n";
-        return ok ? 0 : 1;
+        /* Burn_VerifyWrite() is the real implementation: it reads the disc
+         * back and compares it with the image. The older VerifyDisc() only
+         * checked the image file and never read the disc. */
+        const int level = (argc >= 5 && std::string(argv[4]) == "full")
+                              ? BURN_VERIFY_FULL : BURN_VERIFY_QUICK;
+        const int rc = Burn_VerifyWrite(argv[2], argv[3], level);
+        std::cout << (rc == BURN_SUCCESS ? "OK" : "FAILED: " + util.GetLastErrorMessage())
+                  << "\n";
+        return rc == BURN_SUCCESS ? 0 : 1;
     }
     if (cmd == "burn-job" && argc >= 4) {
         BurnJobOptions options = makeOptions(BURN_JOB_MODE_IMAGE);

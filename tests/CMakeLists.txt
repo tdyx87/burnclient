@@ -61,6 +61,32 @@ target_include_directories(hw_check PRIVATE
     ${CMAKE_SOURCE_DIR}/src
 )
 
+# The ABI check links against the library exactly like an external caller
+# would and checks that the exported surface matches the public header.
+add_executable(test_abi
+    test_abi.cpp
+)
+
+target_link_libraries(test_abi PRIVATE BurningDLL Threads::Threads)
+
+target_include_directories(test_abi PRIVATE
+    ${CMAKE_SOURCE_DIR}/src
+)
+
+if(MSVC)
+    target_compile_definitions(test_abi PRIVATE _CRT_SECURE_NO_WARNINGS)
+endif()
+
+add_test(NAME abi_consistency
+    COMMAND test_abi
+    WORKING_DIRECTORY $<TARGET_FILE_DIR:test_abi>
+)
+
+set_tests_properties(abi_consistency PROPERTIES
+    TIMEOUT 60
+    LABELS "unit;abi"
+)
+
 # The web console is exercised over real HTTP against a running server, so
 # it is registered as a test and the server binary is passed to it.
 add_executable(test_webui

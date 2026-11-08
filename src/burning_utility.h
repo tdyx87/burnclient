@@ -186,13 +186,13 @@ DLL_API int CreateISOToDisc(const char* isoPath, const char* devicePath, const c
 DLL_API int BurnDirectoryToDisc(const char* sourceDir, const char* devicePath, const char* discType, int speed);
 DLL_API int CreateISOImage(const char* sourcePath, const char* isoPath, const char* volumeLabel);
 
-/* VerifyDisc validates the IMAGE FILE only (existence, non-empty, readable).
- * Byte-level read-back of the written disc is not implemented on any
- * backend, so this function now returns BURN_ERROR_UNSUPPORTED_FORMAT with
- * an explanatory last-error INSTEAD OF the previous misleading BURN_SUCCESS
- * whenever the file checks pass but no read-back was performed. Treat any
- * result other than BURN_SUCCESS as "not verified" and hash the disc
- * yourself (e.g. by mounting it) if you need integrity assurance. */
+/* VerifyDisc is superseded by Burn_VerifyWrite(), which really reads the
+ * disc back and compares it with the image sector by sector. This function
+ * only ever validated the IMAGE FILE (existence, non-empty, readable) and
+ * then reported BURN_ERROR_UNSUPPORTED_FORMAT with an explanatory
+ * last-error instead of the previous misleading BURN_SUCCESS, because a
+ * file that was never compared with a disc must not look verified.
+ * New code should call Burn_VerifyWrite(). */
 DLL_API int VerifyDisc(const char* devicePath, const char* isoPath);
 
 DLL_API int ListBurningDevices(DeviceInfo** devices, int* deviceCount);
