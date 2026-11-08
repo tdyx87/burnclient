@@ -8,7 +8,9 @@
  * optical drive. Replace it with BURN_JOB_MODE_IMAGE / _DIRECTORY for real
  * burning; the status/cancel/wait logic is identical.
  */
-#include "../src/burning_utility.h"
+/* "burning_utility.h" resolves both inside the source tree (CMake passes
+ * -I src) and inside an installed SDK (compile with -I include). */
+#include "burning_utility.h"
 #include <stdio.h>
 #include <string.h>
 
@@ -87,8 +89,13 @@ int main(int argc, char** argv) {
     }
     printf("Job error string: %s\n", Burn_GetJobErrorMessage(job));
 
-    /* Always release. A second release returns BURN_ERROR_INVALID_HANDLE. */
-    printf("Release: %d (second release: %d)\n",
-           Burn_Release(job), Burn_Release(job));
+    /* Always release. A second release returns BURN_ERROR_INVALID_HANDLE.
+     * Note the two calls are SEPARATE statements: inside a single printf()
+     * the evaluation order of the arguments is unspecified, so "Release: %d
+     * (second: %d)" could print the two results swapped depending on the
+     * compiler/optimiser (observed with MSVC /O2). */
+    int rel1 = Burn_Release(job);
+    int rel2 = Burn_Release(job);
+    printf("Release: %d (second release: %d)\n", rel1, rel2);
     return status.state == BURN_JOB_COMPLETED || status.state == BURN_JOB_CANCELLED ? 0 : 1;
 }

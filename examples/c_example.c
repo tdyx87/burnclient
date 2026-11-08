@@ -1,4 +1,6 @@
-#include "../src/burning_utility.h"
+/* "burning_utility.h" resolves both inside the source tree (CMake passes
+ * -I src) and inside an installed SDK (compile with -I include). */
+#include "burning_utility.h"
 #include <stdio.h>
 #include <stdlib.h>
 

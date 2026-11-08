@@ -1,4 +1,8 @@
-#include "../src/burning_utility.h"
+/* "burning_utility.h" resolves both inside the source tree (CMake passes
+ * -I src) and inside an installed SDK (compile with -I include). A path
+ * like "../src/..." breaks the moment the file is shipped without src/,
+ * which is exactly what the SDK package does. */
+#include "burning_utility.h"
 #include <iostream>
 #include <vector>
 #include <string>

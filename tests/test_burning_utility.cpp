@@ -2,10 +2,17 @@
 #include <cassert>
 #include <cstdio>
 #include <cstring>
+#include <string>
 #include <stdexcept>
 #include <thread>
 #include <atomic>
 #include <chrono>
+#ifdef _WIN32
+#include <direct.h>
+#else
+#include <sys/stat.h>
+#include <unistd.h>
+#endif
 #include "../src/burning_utility.h"
 
 /* CHECK() compiles its argument away under NDEBUG, which silently removes
@@ -79,8 +86,11 @@ static void TestLegacySurface() {
     ClearLastError();
     std::cout << "Last error: '" << GetLastErrorMessage() << "'" << std::endl;
 
-    /* Exercise the legacy exception boundary: VerifyDisc() fires two global
-     * progress callbacks, both of which throw here. */
+    /* Exercise the legacy exception boundary: VerifyDisc() fires a global
+     * progress callback which throws here. Since the disc read-back fix,
+     * a present-but-unverifiable image returns UNSUPPORTED_FORMAT instead
+     * of the misleading SUCCESS; the callback still ran and threw, and the
+     * call returning normally proves containment. */
     const char* probeIso = "burn_verify_probe.iso";
     FILE* probe = fopen(probeIso, "wb");
     CHECK(probe != nullptr);
@@ -90,10 +100,16 @@ static void TestLegacySurface() {
     SetProgressCallback(ThrowingProgressCallback, nullptr);
     int verifyResult = VerifyDisc("probe-device", probeIso);
     SetProgressCallback(nullptr, nullptr);
+    std::cout << "VerifyDisc no-readback honesty: rc=" << verifyResult
+              << " err='" << GetLastErrorMessage() << "'" << std::endl;
+    CHECK(verifyResult == BURN_ERROR_UNSUPPORTED_FORMAT);
+    CHECK(std::strlen(GetLastErrorMessage()) > 0);
+
+    /* A missing image file is still a parameter error, not "unsupported". */
+    CHECK(VerifyDisc("probe-device", "burn_definitely_absent.iso")
+          == BURN_ERROR_INVALID_PARAM);
     remove(probeIso);
-    std::cout << "Throwing legacy callback contained: "
-              << (verifyResult == BURN_SUCCESS ? "yes" : "no") << std::endl;
-    CHECK(verifyResult == BURN_SUCCESS);
+    std::cout << "Throwing legacy callback contained: yes (call returned)" << std::endl;
 }
 
 static void TestValidationAndFailure() {
@@ -263,6 +279,130 @@ static void TestCppWrapperAndLegacyCancel() {
     CHECK(Burn_GetActiveJobCount() == 0);
 }
 
+/* Regression for the process-wide default configuration.
+ *
+ * SetDefault* used to be thread_local: a job started from a worker thread
+ * silently saw "no default device" and failed, even though the main thread
+ * had configured one. The defaults must now be visible on every thread. */
+static void TestProcessWideDefaults() {
+    std::cout << "\n=== Defaults are process-wide (cross-thread) ===" << std::endl;
+
+    SetDefaultDevice("Z:\\configured-on-main");
+    SetDefaultDiscType("DVD+R");
+    SetDefaultSpeed(8);
+
+    /* Read them back from a foreign thread. */
+    bool deviceVisible = false;
+    bool errThreadLocalStillWorks = false;
+    std::thread worker([&]() {
+        char buf[512];
+        buf[0] = '\0';
+        deviceVisible = (GetDefaultDevice(buf, sizeof(buf)) == BURN_SUCCESS)
+                        && std::strcmp(buf, "Z:\\configured-on-main") == 0;
+        /* Last-error stays per-thread: setting it here must not leak. */
+        Burn_GetStatus(BURN_INVALID_JOB_HANDLE, nullptr);
+        errThreadLocalStillWorks = (std::strlen(GetLastErrorMessage()) > 0);
+    });
+    worker.join();
+
+    std::cout << "Device default visible on worker: " << (deviceVisible ? "yes" : "NO") << std::endl;
+    CHECK(deviceVisible);
+    CHECK(errThreadLocalStillWorks);
+
+    /* A job started on a worker with devicePath=NULL must inherit the
+     * default instead of failing with "No burning device specified".
+     * The source file EXISTS (so validation passes) but the default device
+     * is fake: the job must get PAST the device check and fail later, at
+     * the backend, proving the worker saw the main thread's default. */
+    {
+        FILE* src = fopen("burn_default_inherit.iso", "wb");
+        CHECK(src != nullptr);
+        if (src) { fwrite("PROBE-ISO", 1, 9, src); fclose(src); }
+    }
+    std::atomic<int> rc{999};
+    std::string errMsg;
+    std::thread worker2([&]() {
+        BurnJobOptions options;
+        std::memset(&options, 0, sizeof(options));
+        options.size = (int)sizeof(options);
+        options.mode = BURN_JOB_MODE_IMAGE;
+        options.sourcePath = "burn_default_inherit.iso";
+        options.devicePath = nullptr;  /* use the configured default */
+        BurnJobStatus st;
+        std::memset(&st, 0, sizeof(st));
+        st.size = (int)sizeof(st);
+        rc.store(Burn_Simple(&options, &st));
+        errMsg = st.errorMessage;
+    });
+    worker2.join();
+    remove("burn_default_inherit.iso");
+    std::cout << "Worker job rc=" << rc.load() << " err='" << errMsg << "'" << std::endl;
+    CHECK(errMsg.find("No burning device") == std::string::npos);
+    /* DEVICE_NOT_FOUND (-2) here would mean the default was NOT inherited:
+     * that is the exact pre-fix signature. */
+    CHECK(rc.load() != BURN_ERROR_DEVICE_NOT_FOUND);
+
+    /* Reset so later tests see a clean slate. */
+    SetDefaultDevice("");
+}
+
+/* Regression for absolute-path normalisation at the API boundary.
+ *
+ * libisofs rejects RELATIVE source directories while IMAPI2 accepts them,
+ * so CreateISOImage("./dir") worked on Windows and failed on Linux. The
+ * engine now normalises paths before handing them to a backend. */
+static void TestRelativeSourcePath() {
+    std::cout << "\n=== Relative source path works on every backend ===" << std::endl;
+
+#ifdef _WIN32
+    _mkdir("burn_rel_dir");
+#else
+    mkdir("burn_rel_dir", 0777);
+#endif
+    FILE* f = fopen("burn_rel_dir/inside.txt", "wb");
+    if (!f) {
+        std::cout << "SKIP: cannot create the relative test directory" << std::endl;
+        return;
+    }
+    fwrite("payload", 1, 7, f);
+    fclose(f);
+
+    BurnJobOptions options;
+    std::memset(&options, 0, sizeof(options));
+    options.size = (int)sizeof(options);
+    options.mode = BURN_JOB_MODE_CREATE_IMAGE;
+    options.sourcePath = "burn_rel_dir";          /* deliberately RELATIVE */
+    options.outputPath = "burn_rel_out.iso";
+    options.volumeLabel = "RELATIVE";
+
+    BurnJobStatus st;
+    std::memset(&st, 0, sizeof(st));
+    st.size = (int)sizeof(st);
+    int rc = Burn_Simple(&options, &st);
+    std::cout << "CreateISOImage(relative src) rc=" << rc
+              << " err='" << st.errorMessage << "'" << std::endl;
+
+    if (rc == BURN_SUCCESS) {
+        std::cout << "  image created from a relative path" << std::endl;
+    } else {
+        /* Environment may lack a working image writer (unwritable TEMP,
+         * missing COM component). That is acceptable here, but the old
+         * relative-path rejection signature must NEVER come back. */
+        CHECK(std::string(st.errorMessage).find("add source directory")
+              == std::string::npos);
+        std::cout << "  non-path failure tolerated: " << st.errorMessage << std::endl;
+    }
+    CHECK(rc == BURN_SUCCESS || rc == BURN_ERROR_ISO_CREATION_FAILED);
+
+    remove("burn_rel_out.iso");
+    remove("burn_rel_dir/inside.txt");
+#ifdef _WIN32
+    _rmdir("burn_rel_dir");
+#else
+    rmdir("burn_rel_dir");
+#endif
+}
+
 int main() {
     std::cout << "=== Burning Utility Unit Tests ===" << std::endl;
 
@@ -271,6 +411,8 @@ int main() {
     TestCancellation();
     TestSuccessAndExceptionContainment();
     TestCppWrapperAndLegacyCancel();
+    TestProcessWideDefaults();
+    TestRelativeSourcePath();
 
     if (g_failures != 0) {
         std::cout << "\n" << g_failures << " CHECK(s) FAILED" << std::endl;
