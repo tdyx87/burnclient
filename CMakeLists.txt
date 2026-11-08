@@ -160,16 +160,32 @@ target_include_directories(job_example PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
 
 # Local web console. It needs no GUI toolchain, so it builds everywhere the
 # library builds, and it is driven by the automated test suite.
+#
+# The page itself lives in examples/console.html as a real file: keeping the
+# script out of a C string literal means ordinary JavaScript tooling can
+# check it, and no escaping mistake can silently break it.
 add_executable(burn_webui examples/burn_webui.cpp)
 target_link_libraries(burn_webui PRIVATE ${PROJECT_NAME} Threads::Threads)
 target_include_directories(burn_webui PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
 if(BURN_EXE_INSTALL_RPATH)
     set_target_properties(burn_webui PROPERTIES INSTALL_RPATH "${BURN_EXE_INSTALL_RPATH}")
 endif()
+# The page must sit next to the executable: the server looks for it there.
+add_custom_command(TARGET burn_webui POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different
+        "${CMAKE_CURRENT_SOURCE_DIR}/examples/console.html"
+        "$<TARGET_FILE_DIR:burn_webui>/console.html"
+    COMMENT "Copying the console page next to burn_webui"
+    VERBATIM
+)
+# The page must be readable when the server starts from the build tree.
+target_compile_definitions(burn_webui PRIVATE
+    BURN_WEBUI_PAGE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/examples")
 # The page is written in Chinese; MSVC must read the file as UTF-8 instead of
 # the system code page, or C4819 warns and the literals can be mangled.
 if(MSVC)
     target_compile_options(burn_webui PRIVATE /utf-8)
+    target_compile_definitions(burn_webui PRIVATE _CRT_SECURE_NO_WARNINGS)
 endif()
 
 # The tests come last: the console test drives the burn_webui binary, so
@@ -179,6 +195,9 @@ add_subdirectory(tests)
 # These are part of the downloadable SDK: the CLI lands in bin/ next to the
 # shared library, and the samples show how to consume the C/C++/C# APIs.
 install(TARGETS burn_cli burn_webui RUNTIME DESTINATION bin)
+# The console page travels with the executable: the server reads it from
+# the directory it was started in.
+install(FILES examples/console.html DESTINATION bin)
 install(FILES
     examples/c_example.c
     examples/cpp_example.cpp
