@@ -10,6 +10,11 @@ target_include_directories(test_burning_utility PRIVATE
     ${CMAKE_SOURCE_DIR}/src
 )
 
+if(MSVC)
+    # The tests use the portable fopen/remove spelling on purpose.
+    target_compile_definitions(test_burning_utility PRIVATE _CRT_SECURE_NO_WARNINGS)
+endif()
+
 add_test(NAME burning_utility_tests
     COMMAND test_burning_utility
     WORKING_DIRECTORY $<TARGET_FILE_DIR:test_burning_utility>
@@ -55,3 +60,33 @@ target_link_libraries(hw_check PRIVATE BurningDLL Threads::Threads)
 target_include_directories(hw_check PRIVATE
     ${CMAKE_SOURCE_DIR}/src
 )
+
+# The web console is exercised over real HTTP against a running server, so
+# it is registered as a test and the server binary is passed to it.
+add_executable(test_webui
+    test_webui.cpp
+)
+
+target_link_libraries(test_webui PRIVATE BurningDLL Threads::Threads)
+
+target_include_directories(test_webui PRIVATE
+    ${CMAKE_SOURCE_DIR}/src
+)
+
+if(MSVC)
+    # The tests use the portable fopen/remove spelling on purpose.
+    target_compile_definitions(test_webui PRIVATE _CRT_SECURE_NO_WARNINGS)
+    target_compile_definitions(test_v3_capabilities PRIVATE _CRT_SECURE_NO_WARNINGS)
+    target_compile_definitions(hw_check PRIVATE _CRT_SECURE_NO_WARNINGS)
+endif()
+if(TARGET burn_webui)
+    add_dependencies(test_webui burn_webui)
+    add_test(NAME webui_console
+        COMMAND test_webui $<TARGET_FILE:burn_webui>
+        WORKING_DIRECTORY $<TARGET_FILE_DIR:test_webui>
+    )
+    set_tests_properties(webui_console PROPERTIES
+        TIMEOUT 180
+        LABELS "unit;ui"
+    )
+endif()

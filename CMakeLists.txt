@@ -135,7 +135,6 @@ configure_file(
 install(FILES ${CMAKE_CURRENT_BINARY_DIR}/packaging/README.txt DESTINATION .)
 
 enable_testing()
-add_subdirectory(tests)
 
 # Example CLI tool
 add_executable(burn_cli examples/burn_cli.cpp)
@@ -143,6 +142,10 @@ target_link_libraries(burn_cli PRIVATE ${PROJECT_NAME})
 target_include_directories(burn_cli PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
 if(BURN_EXE_INSTALL_RPATH)
     set_target_properties(burn_cli PROPERTIES INSTALL_RPATH "${BURN_EXE_INSTALL_RPATH}")
+endif()
+if(MSVC)
+    # The CLI uses the portable getenv spelling on purpose.
+    target_compile_definitions(burn_cli PRIVATE _CRT_SECURE_NO_WARNINGS)
 endif()
 
 # Build the plain-C samples too. This is a compile-time guard that the public
@@ -155,9 +158,27 @@ add_executable(job_example examples/job_example.c)
 target_link_libraries(job_example PRIVATE ${PROJECT_NAME})
 target_include_directories(job_example PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
 
+# Local web console. It needs no GUI toolchain, so it builds everywhere the
+# library builds, and it is driven by the automated test suite.
+add_executable(burn_webui examples/burn_webui.cpp)
+target_link_libraries(burn_webui PRIVATE ${PROJECT_NAME} Threads::Threads)
+target_include_directories(burn_webui PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+if(BURN_EXE_INSTALL_RPATH)
+    set_target_properties(burn_webui PROPERTIES INSTALL_RPATH "${BURN_EXE_INSTALL_RPATH}")
+endif()
+# The page is written in Chinese; MSVC must read the file as UTF-8 instead of
+# the system code page, or C4819 warns and the literals can be mangled.
+if(MSVC)
+    target_compile_options(burn_webui PRIVATE /utf-8)
+endif()
+
+# The tests come last: the console test drives the burn_webui binary, so
+# that target must already exist when the tests directory is processed.
+add_subdirectory(tests)
+
 # These are part of the downloadable SDK: the CLI lands in bin/ next to the
 # shared library, and the samples show how to consume the C/C++/C# APIs.
-install(TARGETS burn_cli RUNTIME DESTINATION bin)
+install(TARGETS burn_cli burn_webui RUNTIME DESTINATION bin)
 install(FILES
     examples/c_example.c
     examples/cpp_example.cpp
