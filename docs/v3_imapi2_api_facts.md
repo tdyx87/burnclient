@@ -179,7 +179,7 @@ v3 增：`put_CreateRedundantUdfMetadataFiles(VARIANT_BOOL)`, `ProbeSpecificFile
 `InitializeDiscRecorder(BSTR)`, `ReleaseExclusiveAccess`,
 `AcquireExclusiveAccess(VARIANT_BOOL force, BSTR clientName)`,
 `EjectMedia()`, `CloseTray()`, `get_ProductId(BSTR*)`, `get_VendorId`,
-`get_ProductRevision`, `get_VolumePathNames(SAFEARRAY** /* of BSTR */)`,
+`get_ProductRevision`, `get_VolumePathNames(SAFEARRAY** /* of VARIANT/VT_BSTR */)`,
 `get_VolumeName`, `get_LegacyDeviceNumber`, `get_DeviceCanLoadMedia`,
 `get_SupportedProfiles(SAFEARRAY**)`, `get_CurrentProfiles(SAFEARRAY**)`,
 `get_SupportedFeaturePages`, `get_SupportedModePages`,
@@ -226,6 +226,73 @@ CD-DA：1 扇区 = 2352 字节 = 588 采样帧（4 字节/帧）；扇区/秒 = 
   ctx 指针**再 `ClearBurnCancelHook(fn, ctx)`（它会等待在途钩子返回）。
 - 每个 COM 对象在**所有**错误路径上 `Release()`；`BSTR` 用 `SysFreeString`；
   `SAFEARRAY` 用 `SafeArrayDestroy`；`CoTaskMemFree` 用于 `BYTE**` 输出。
+- `get_VolumePathNames` 返回 `SAFEARRAY(VARIANT/VT_BSTR)`，不是 `SAFEARRAY(BSTR)`；
+  `get_MultisessionInterfaces` / `get_SupportedWriteSpeedDescriptors` 返回
+  `SAFEARRAY(VARIANT/VT_DISPATCH)`；`get_UDFRevisionsSupported` /
+  `get_SupportedProfiles` / `get_SupportedWriteSpeeds` 等的整数列表也是
+  `SAFEARRAY(VARIANT/VT_I4)`。一律先用 `SafeArrayGetElemsize` /
+  `SafeArrayGetVartype` 判断元素布局，读出的 `VARIANT` 副本用 `VariantClear`，
+  `BSTR` 副本用 `SysFreeString`，`IDispatch` 副本用 `Release`。
 - 设备匹配只用**精确卷路径比较**，绝不"取第一个设备"。
 - 写盘结果判定顺序：**成功优先于迟到取消**。
 - 内部字符串按 UTF-8 处理，与 COM 交互时 `MultiByteToWideChar(CP_UTF8, ...)`。
+- 读取**已插入光盘的物理类型**只能用
+  `IDiscFormat2Data::get_CurrentPhysicalMediaType`（`IDiscFormat2Erase`
+  也暴露同名属性）。`IDiscRecorder2::get_CurrentProfiles` 是驱动器当前
+  宣告的功能 profile 列表（可同时多项），不是介质类型，不能拿来代替。
+  `IMAPI_MEDIA_TYPE_UNKNOWN` 表示「无盘或无法识别」，不要据此断言一定有盘。
+
+## 6. 对外读盘型接口（新增）
+
+- `Burn_GetMediaType(devicePath)` 返回 `const char*`（DLL 内 thread_local
+  缓冲，不要 free），例如 `CD-R` / `DVD+RW` / `BD-RE`；空串表示后端无法报告。
+- `Burn_GetMediaTypeCode(devicePath)` 返回与后端无关的 `BURN_MEDIA_*` 码，
+  便于程序分支；`BURN_MEDIA_UNKNOWN=0` 表示无法判断。
+- 两者都是实时查询，插拔盘后需重新调用。libburn / drutil 后端目前走
+  `IPlatform` 默认实现（诚实返回「不支持」），不伪造盘型。
+- Web 控制台：`GET /api/media?device=F:` 返回 `{"type","code"}`；
+  `/api/devices` 每项附带 `mediaType` / `mediaCode`。
+- CLI：`burn_cli media-type F:`；`list-devices` 输出附加 `disc=` 列。
+
+## 7. 介质就绪状态（真实刻录机空仓问题）
+
+`IDiscRecorder2::InitializeDiscRecorder()` 在**空仓**时也会成功：它只证明
+驱动器可独占打开，不证明里面有可写介质。此时直接 `IDiscFormat2Data::Write()`
+会返回 `E_IMAPI_DF2DATA_MEDIA_IS_NOT_SUPPORTED`(`0xC0AA0406`)，用户只看到
+一个 HRESULT，不知道要插盘。相关 SDK 常量：
+
+- `E_IMAPI_RECORDER_MEDIA_NO_MEDIA` = `0xC0AA0202`（无盘）
+- `E_IMAPI_RECORDER_MEDIA_INCOMPATIBLE` = `0xC0AA0203`（介质不兼容/格式未知，
+  空仓时 `get_CurrentPhysicalMediaType` 常返回这个）
+- `E_IMAPI_DF2DATA_MEDIA_NOT_BLANK` = `0xC0AA0405`
+- `E_IMAPI_DF2DATA_MEDIA_IS_NOT_SUPPORTED` = `0xC0AA0406`
+
+三个只读属性组合起来才能判断「现在能不能刻」：
+
+- `get_CurrentPhysicalMediaType` -> 是否有可识别盘片；
+- `IsCurrentMediaSupported(recorder, VARIANT_BOOL*)` -> 该 recorder 是否接受此介质；
+- `get_CurrentMediaStatus` -> `BLANK(0x2)` / `APPENDABLE(0x4)` /
+  `OVERWRITE_ONLY(0x1)` / `WRITE_PROTECTED(0x2000)` / `FINALIZED(0x4000)` /
+  `DAMAGED(0x400)` / `ERASE_REQUIRED(0x800)` / `UNSUPPORTED_MEDIA(0x8000)`。
+  注意 `INFORMATIONAL_MASK=0xf`，`UNSUPPORTED_MASK=0xfc00`。
+
+对外接口：
+
+- `Burn_GetMediaState(devicePath)` 返回 `BURN_MEDIA_STATE_*` 位掩码，
+  `-1` 表示设备无法解析；`BURN_MEDIA_STATE_READY` 为计算位；
+  `QUERY_UNSUPPORTED` 表示后端查不到（libburn / drutil 默认实现）。
+- `Burn_GetMediaStateText(devicePath)` 返回一句简短英文原因；
+  `Burn_GetMediaState` / `Text` 都是实时查询。
+- `DeviceInfo.isWritable` 在 Windows 现在要求「recorder 可打开 **且**
+  有可写盘片」，空仓真实刻录机为 `0`；`isEmpty` 只在 `BLANK` 时为 `1`。
+  Linux/macOS 后端仍按原有 MMC / drutil 语义，不改。
+- 刚插盘时光驱会短暂返回 `BECOMING_READY`(`0xC0AA0205`) /
+  `INCOMPATIBLE`(`0xC0AA0203`) / `NO_MEDIA`(`0xC0AA0202`) /
+  `FORMAT_IN_PROGRESS`(`0xC0AA0206`)。介质查询做 3 次 × 500 ms 有界重试，
+  避免把正在上电的真实刻录机误判为不可用（空仓仍会在 ~1.5 s 后给出明确原因）。
+- `BurnImageFile()` 在 `Write()` 前用同一个 writer 做
+  `IsCurrentMediaSupported` 预检，只在明确返回 `VARIANT_FALSE` 时提前失败；
+  `Write()` 失败信息追加可读的 HRESULT 解释（见 `WriteFailureHint`）。
+- `burn_cli media-state F:`；`/api/devices` 与 `/api/media` 增加
+  `state` / `ready` / `reason`；`/api/start` 对 IMAGE/DIRECTORY/APPEND
+  模式做同样的预检，避免浏览器提交一个必然失败的作业。

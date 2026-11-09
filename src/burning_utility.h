@@ -11,16 +11,20 @@
 
 /* DeviceInfo struct - plain C-compatible, safe across DLL boundary
  *
- * isWritable: truthful capability report from the backend.
- *   - Windows: 1 when IMAPI2 could exclusively open the recorder, 0 when the
- *     driver is write-protected or the device is busy (see deviceName).
+ * isWritable: truthful "can I burn to this right now" report.
+ *   - Windows: 1 only when IMAPI2 can exclusively open the recorder AND a
+ *     usable writable disc is present (blank, appendable or rewritable).
+ *     A real drive with an empty tray therefore reports 0, instead of being
+ *     offered for burning and failing later with 0xC0AA0406. See
+ *     Burn_GetMediaState() for the detailed reason.
  *   - Linux: from the MMC capability bits of the drive scan; DVD+R/DVD+RW/
  *     DVD-RW/BD-only recorders may report 0 there (documented libburn gap).
  *   - macOS: 1 for every row of `drutil list`, which enumerates burning
  *     devices only; a machine without a recorder returns an EMPTY list,
  *     never a fabricated device.
- * isEmpty: assumed 1 - media state is deliberately not probed during
- * enumeration (that would spin idle drives up in a UI refresh). */
+ * isEmpty: 1 only for a blank disc. 0 means non-blank, unknown or no disc.
+ * Windows probes media state during enumeration; probing is read-only and
+ * may briefly spin up an idle drive. */
 typedef struct {
     char devicePath[512];
     char deviceName[256];
@@ -139,6 +143,20 @@ public:
     virtual int EjectTray(const std::string& devicePath);
     virtual int CloseTray(const std::string& devicePath);
     virtual std::string DriveInformation(const std::string& devicePath);
+
+    /* Physical media currently inserted in this drive. The default bodies
+     * report "unsupported"; a backend overrides them when it can ask the
+     * drive. MediaType is a short stable name, MediaTypeCode its BURN_MEDIA_*
+     * counterpart. */
+    virtual std::string MediaType(const std::string& devicePath);
+    virtual int MediaTypeCode(const std::string& devicePath);
+
+    /* Live readiness of the media in a drive. MediaState is a bitmask of
+     * BURN_MEDIA_STATE_* flags (or -1 if the device cannot be resolved);
+     * MediaStateText is one short English sentence explaining why a drive
+     * is or is not usable. Defaults report QUERY_UNSUPPORTED. */
+    virtual int MediaState(const std::string& devicePath);
+    virtual std::string MediaStateText(const std::string& devicePath);
 };
 
 /* Internal factory - called only within the DLL, not exported */
@@ -305,6 +323,76 @@ DLL_API int BurnCloseTray(const char* devicePath);
  * profiles, media state, speeds). Returns a pointer to a thread-local
  * buffer; do NOT free. Empty string when unsupported or unknown. */
 DLL_API const char* Burn_GetDriveInformation(const char* devicePath);
+
+/* ---------------------------------------------------------------------------
+ * Inserted-media identification
+ *
+ * Burn_GetMediaType() reports the physical disc in a drive as a short, stable
+ * name (for example "CD-R", "DVD+RW", "BD-RE"). Burn_GetMediaTypeCode()
+ * returns the matching BURN_MEDIA_* code so callers can branch without
+ * parsing text. Both are live queries: re-read after inserting or ejecting a
+ * disc. An empty name / BURN_MEDIA_UNKNOWN means the backend could not tell;
+ * GetLastErrorMessage() then carries the reason.
+ * ------------------------------------------------------------------------- */
+#define BURN_MEDIA_UNKNOWN       0
+#define BURN_MEDIA_NONE          1  /* no disc inserted                      */
+#define BURN_MEDIA_CD_ROM        2
+#define BURN_MEDIA_CD_R          3
+#define BURN_MEDIA_CD_RW         4
+#define BURN_MEDIA_DVD_ROM       5
+#define BURN_MEDIA_DVD_R         6
+#define BURN_MEDIA_DVD_RW        7
+#define BURN_MEDIA_DVD_PLUS_R    8
+#define BURN_MEDIA_DVD_PLUS_RW   9
+#define BURN_MEDIA_DVD_RAM      10
+#define BURN_MEDIA_DVD_DL       11 /* any dual-layer DVD variant           */
+#define BURN_MEDIA_BD_ROM       12
+#define BURN_MEDIA_BD_R         13
+#define BURN_MEDIA_BD_RE        14
+#define BURN_MEDIA_HD_DVD       15
+#define BURN_MEDIA_OTHER        16
+
+/* Human-readable media name; pointer to a thread-local DLL-owned buffer,
+ * valid until the next call on the same thread. Do NOT free. */
+DLL_API const char* Burn_GetMediaType(const char* devicePath);
+/* BURN_MEDIA_* code, or BURN_MEDIA_UNKNOWN when the backend cannot tell. */
+DLL_API int Burn_GetMediaTypeCode(const char* devicePath);
+
+/* ---------------------------------------------------------------------------
+ * Media readiness (live query)
+ *
+ * Knowing the disc type is not enough to decide whether a burn will work:
+ * a perfectly good recorder with an empty tray has no writable medium, and
+ * IMAPI2 reports that only at Write() time as E_IMAPI_DF2DATA_MEDIA_IS_NOT_
+ * SUPPORTED (0xC0AA0406). Burn_GetMediaState() makes that check explicit.
+ *
+ * The returned value is a bitmask of BURN_MEDIA_STATE_* flags, or -1 when
+ * devicePath is missing / the recorder cannot be resolved. BURN_MEDIA_STATE_
+ * READY is a computed convenience bit: it is set only when the recorder is
+ * usable, a supported disc is present, the disc is blank / appendable /
+ * rewritable, and it is not write-protected, finalized or damaged.
+ *
+ * Burn_GetMediaStateText() returns one short, stable English sentence that
+ * is safe to show to a user and explains what to do next. Both functions
+ * are live queries: re-read after inserting, ejecting or erasing a disc.
+ * ------------------------------------------------------------------------- */
+#define BURN_MEDIA_STATE_RECORDER_OK         0x0001
+#define BURN_MEDIA_STATE_MEDIA_PRESENT       0x0002
+#define BURN_MEDIA_STATE_MEDIA_SUPPORTED     0x0004
+#define BURN_MEDIA_STATE_WRITE_PROTECTED     0x0008
+#define BURN_MEDIA_STATE_BLANK               0x0010
+#define BURN_MEDIA_STATE_APPENDABLE          0x0020
+#define BURN_MEDIA_STATE_OVERWRITE_ONLY      0x0040
+#define BURN_MEDIA_STATE_FINALIZED           0x0080
+#define BURN_MEDIA_STATE_DAMAGED             0x0100
+#define BURN_MEDIA_STATE_ERASE_REQUIRED      0x0200
+#define BURN_MEDIA_STATE_READY               0x2000
+#define BURN_MEDIA_STATE_QUERY_UNSUPPORTED   0x4000
+
+DLL_API int Burn_GetMediaState(const char* devicePath);
+/* Short human-readable reason; pointer to a thread-local DLL-owned buffer,
+ * valid until the next call on the same thread. Do NOT free. */
+DLL_API const char* Burn_GetMediaStateText(const char* devicePath);
 
 /* Byte-level read-back of a written disc against the image it came from.
  * This is the verification VerifyDisc() cannot offer: it compares sector by

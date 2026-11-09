@@ -21,6 +21,7 @@
 
 #include <windows.h>
 #include <imapi2.h>
+#include <imapi2error.h>   /* E_IMAPI_* HRESULT values for readable failures */
 #include <imapi2fs.h>
 #include <shlwapi.h>
 #include <oleauto.h>
@@ -149,6 +150,156 @@ private:
     SAFEARRAY* a_;
 };
 
+/* IDiscRecorder2::get_VolumePathNames() returns a SAFEARRAY of VARIANT /
+ * VT_BSTR values; the path is in bstrVal. Also accept a plain SAFEARRAY(BSTR)
+ * for compatibility. SafeArrayGetElement() copies the element, so the copy
+ * must be cleared with VariantClear() or SysFreeString(). */
+static std::string VolumePathAt(SAFEARRAY* paths, LONG index) {
+    if (!paths) return "";
+    const UINT elemSize = SafeArrayGetElemsize(paths);
+    VARTYPE elemType = VT_EMPTY;
+    if (FAILED(SafeArrayGetVartype(paths, &elemType))) {
+        elemType = VT_EMPTY;
+    }
+    if (elemSize == sizeof(VARIANT)) {
+        elemType = VT_VARIANT;
+    } else if (elemSize == sizeof(BSTR)) {
+        elemType = VT_BSTR;
+    }
+
+    if (elemType == VT_VARIANT) {
+        VARIANT value;
+        VariantInit(&value);
+        std::string result;
+        if (SUCCEEDED(SafeArrayGetElement(paths, &index, &value)) &&
+            value.vt == VT_BSTR && value.bstrVal) {
+            result = BstrToUtf8(value.bstrVal);
+        }
+        VariantClear(&value);
+        return result;
+    }
+    if (elemType == VT_BSTR) {
+        BSTR text = nullptr;
+        std::string result;
+        if (SUCCEEDED(SafeArrayGetElement(paths, &index, &text)) && text) {
+            result = BstrToUtf8(text);
+            SysFreeString(text);
+        }
+        return result;
+    }
+    return "";
+}
+
+/* Most IMAPI2 SAFEARRAY outputs are SAFEARRAY(VARIANT), but a few are raw
+ * arrays of LONG, BSTR or IDispatch*. Reading a VARIANT element into a LONG
+ * or IDispatch* copies 16 bytes into a 4/8-byte object and corrupts the
+ * stack. Classify by physical element size first, then by the declared
+ * VARTYPE, and always use a VARIANT destination for VARIANT arrays. */
+enum class SafeArrayLayout { Unknown, Variant, Bstr, Dispatch, Long };
+
+static SafeArrayLayout ClassifySafeArray(SAFEARRAY* arr, VARTYPE& vt) {
+    vt = VT_EMPTY;
+    if (!arr) return SafeArrayLayout::Unknown;
+    const UINT elemSize = SafeArrayGetElemsize(arr);
+    if (FAILED(SafeArrayGetVartype(arr, &vt))) {
+        vt = VT_EMPTY;
+    }
+    if (elemSize == sizeof(VARIANT)) return SafeArrayLayout::Variant;
+    if (elemSize == sizeof(LONG) &&
+        (vt == VT_I4 || vt == VT_INT || vt == VT_UI4 || vt == VT_UINT ||
+         vt == VT_EMPTY || vt == VT_VARIANT)) {
+        return SafeArrayLayout::Long;
+    }
+    if (elemSize == sizeof(BSTR) && vt == VT_BSTR) {
+        return SafeArrayLayout::Bstr;
+    }
+    if (elemSize == sizeof(IDispatch*) && (vt == VT_DISPATCH || vt == VT_UNKNOWN)) {
+        return SafeArrayLayout::Dispatch;
+    }
+    switch (vt) {
+    case VT_VARIANT: return SafeArrayLayout::Variant;
+    case VT_BSTR: return SafeArrayLayout::Bstr;
+    case VT_DISPATCH: case VT_UNKNOWN: return SafeArrayLayout::Dispatch;
+    case VT_I4: case VT_INT: case VT_UI4: case VT_UINT: return SafeArrayLayout::Long;
+    default: return SafeArrayLayout::Unknown;
+    }
+}
+
+static bool ReadLongElement(SAFEARRAY* arr, LONG index, LONG& value) {
+    value = 0;
+    VARTYPE vt = VT_EMPTY;
+    const SafeArrayLayout layout = ClassifySafeArray(arr, vt);
+    if (layout == SafeArrayLayout::Variant) {
+        VARIANT v;
+        VariantInit(&v);
+        bool ok = false;
+        if (SUCCEEDED(SafeArrayGetElement(arr, &index, &v))) {
+            if (v.vt == VT_I4 || v.vt == VT_INT) {
+                value = (LONG)v.lVal;
+                ok = true;
+            } else if (v.vt == VT_UI4 || v.vt == VT_UINT) {
+                value = (LONG)v.ulVal;
+                ok = true;
+            } else if (v.vt == VT_I2) {
+                value = (LONG)v.iVal;
+                ok = true;
+            } else if (v.vt == VT_UI2) {
+                value = (LONG)v.uiVal;
+                ok = true;
+            }
+        }
+        VariantClear(&v);
+        return ok;
+    }
+    if (layout == SafeArrayLayout::Long) {
+        LONG raw = 0;
+        if (SUCCEEDED(SafeArrayGetElement(arr, &index, &raw))) {
+            value = raw;
+            return true;
+        }
+    }
+    return false;
+}
+
+static bool ReadDispatchElement(SAFEARRAY* arr, LONG index, IDispatch** out) {
+    if (!out) return false;
+    *out = nullptr;
+    VARTYPE vt = VT_EMPTY;
+    const SafeArrayLayout layout = ClassifySafeArray(arr, vt);
+    if (layout == SafeArrayLayout::Variant) {
+        VARIANT v;
+        VariantInit(&v);
+        bool ok = false;
+        if (SUCCEEDED(SafeArrayGetElement(arr, &index, &v))) {
+            IUnknown* unk = nullptr;
+            if (v.vt == VT_DISPATCH && v.pdispVal) unk = v.pdispVal;
+            else if (v.vt == VT_UNKNOWN && v.punkVal) unk = v.punkVal;
+            if (unk && SUCCEEDED(unk->QueryInterface(IID_IDispatch, (void**)out))) {
+                ok = true;
+            }
+        }
+        VariantClear(&v);
+        return ok;
+    }
+    if (layout == SafeArrayLayout::Dispatch) {
+        if (vt == VT_UNKNOWN) {
+            IUnknown* unk = nullptr;
+            if (SUCCEEDED(SafeArrayGetElement(arr, &index, &unk)) && unk) {
+                const bool ok = SUCCEEDED(unk->QueryInterface(IID_IDispatch, (void**)out));
+                unk->Release();
+                return ok;
+            }
+            return false;
+        }
+        IDispatch* d = nullptr;
+        if (SUCCEEDED(SafeArrayGetElement(arr, &index, &d)) && d) {
+            *out = d;
+            return true;
+        }
+    }
+    return false;
+}
+
 /* ==========================================================================
  * Recorder discovery. A recorder is matched ONLY by exact volume path:
  * writing to the wrong device is unrecoverable, so there is deliberately no
@@ -205,14 +356,10 @@ static bool FindRecorderId(const std::string& devicePath, Bstr& outId) {
             SafeArrayGetLBound(paths, 1, &lb);
             SafeArrayGetUBound(paths, 1, &ub);
             for (LONG k = lb; k <= ub && !found; ++k) {
-                BSTR vp = nullptr;
-                if (SUCCEEDED(SafeArrayGetElement(paths, &k, &vp)) && vp) {
-                    const std::string got = TrimTrailing(BstrToUtf8(vp));
-                    SysFreeString(vp);
-                    if (!got.empty() && !_stricmp(got.c_str(), want.c_str())) {
-                        outId = Bstr(BstrToUtf8(uniqueId));
-                        found = true;
-                    }
+                const std::string got = TrimTrailing(VolumePathAt(paths, k));
+                if (!got.empty() && !_stricmp(got.c_str(), want.c_str())) {
+                    outId = Bstr(BstrToUtf8(uniqueId));
+                    found = true;
                 }
             }
         }
@@ -245,6 +392,16 @@ static Com<IDiscRecorder2> OpenRecorder(BSTR uniqueId) {
 }
 
 static Com<IStream> OpenFileStream(const std::string& path) {
+    /* A directory is never a valid image stream. SHCreateStreamOnFileA
+     * reports 0x80070005 for it, which callers were mistaking for a
+     * recorder or permission fault. Say what actually went wrong. */
+    const DWORD attrs = GetFileAttributesA(path.c_str());
+    if (attrs != INVALID_FILE_ATTRIBUTES &&
+        (attrs & FILE_ATTRIBUTE_DIRECTORY)) {
+        SetBurnLastError("Cannot use a directory as an image file: " + path +
+                         ". Build an ISO from it first (BURN_JOB_MODE_DIRECTORY).");
+        return Com<IStream>();
+    }
     IStream* raw = nullptr;
     HRESULT hr = SHCreateStreamOnFileA(path.c_str(), STGM_READ, &raw);
     Com<IStream> s(raw);
@@ -588,7 +745,7 @@ static int BaseSectorsPerSecond(IDiscFormat2Data* writer, const std::string& dis
             const long lb = descs.lower(), ub = descs.upper();
             if (ub >= lb) {
                 IDispatch* d = nullptr;
-                if (SUCCEEDED(SafeArrayGetElement(descs.get(), (LONG*)&lb, &d)) && d) {
+                if (ReadDispatchElement(descs.get(), (LONG)lb, &d) && d) {
                     IWriteSpeedDescriptor* wsd = nullptr;
                     if (SUCCEEDED(d->QueryInterface(IID_IWriteSpeedDescriptor, (void**)&wsd))
                         && wsd) {
@@ -708,7 +865,7 @@ long long NextSessionStartBlock(const std::string& devicePath) {
         const LONG lb = (LONG)array.lower(), ub = (LONG)array.upper();
         for (LONG k = lb; k <= ub; ++k) {
             IDispatch* d = nullptr;
-            if (FAILED(SafeArrayGetElement(array.get(), &k, &d)) || !d) continue;
+            if (!ReadDispatchElement(array.get(), k, &d) || !d) continue;
             IMultisessionSequential* ms = nullptr;
             if (SUCCEEDED(d->QueryInterface(IID_IMultisessionSequential, (void**)&ms)) && ms) {
                 VARIANT_BOOL supported = VARIANT_FALSE;
@@ -857,7 +1014,7 @@ static bool EnableMultisession(IFileSystemImage* image, IDiscFormat2Data* writer
     const LONG lb = (LONG)array.lower(), ub = (LONG)array.upper();
     for (LONG k = lb; k <= ub && !chosen; ++k) {
         IDispatch* d = nullptr;
-        if (FAILED(SafeArrayGetElement(array.get(), &k, &d)) || !d) continue;
+        if (!ReadDispatchElement(array.get(), k, &d) || !d) continue;
         IMultisessionSequential* ms = nullptr;
         if (SUCCEEDED(d->QueryInterface(IID_IMultisessionSequential, (void**)&ms)) && ms) {
             VARIANT_BOOL supported = VARIANT_FALSE;
@@ -938,7 +1095,7 @@ bool CreateImage(const BurnImageSpec& spec) {
             if (SUCCEEDED(image->get_UDFRevisionsSupported(revs.out())) && revs.get()) {
                 for (LONG k = (LONG)revs.lower(); k <= (LONG)revs.upper(); ++k) {
                     LONG v = 0;
-                    if (SUCCEEDED(SafeArrayGetElement(revs.get(), &k, &v))) {
+                    if (ReadLongElement(revs.get(), k, v)) {
                         char b[16];
                         snprintf(b, sizeof(b), "%s0x%04lX", known.empty() ? "" : " ",
                                  (unsigned long)v);
@@ -1026,6 +1183,38 @@ bool CreateImage(const BurnImageSpec& spec) {
 /* ==========================================================================
  * Image writing with the v3 options
  * ======================================================================== */
+/* Defined in the drive-information section below; needed by the write
+ * preflight that lives earlier in this file. */
+static std::string MediaTypeName(IMAPI_MEDIA_PHYSICAL_TYPE mt);
+static bool IsTransientMediaHr(HRESULT hr);
+
+/* IMAPI2 reports most "you cannot burn to this" conditions only from
+ * Write(), with an HRESULT and no explanation. Translate the ones we can
+ * into an instruction the caller can act on, keeping the original code. */
+static std::string WriteFailureHint(HRESULT hr) {
+    switch (hr) {
+    case E_IMAPI_DF2DATA_MEDIA_IS_NOT_SUPPORTED:
+        return " No writable disc is present or the inserted medium is not "
+               "supported by this recorder. Insert a blank CD-R/DVD-R or a "
+               "rewritable disc; check Burn_GetMediaState() before starting.";
+    case E_IMAPI_DF2DATA_MEDIA_NOT_BLANK:
+        return " The disc is not blank. ForceOverwrite is only enabled for "
+               "randomly writable media (DVD-RAM/DVD+RW); erase a rewritable "
+               "disc or use a blank one.";
+    case E_IMAPI_RECORDER_MEDIA_NO_MEDIA:
+        return " There is no media in the device; insert a blank disc.";
+    case E_IMAPI_RECORDER_MEDIA_INCOMPATIBLE:
+        return " The media is incompatible or of unknown physical format; "
+               "insert a blank CD-R/DVD-R.";
+    case E_IMAPI_RECORDER_MEDIA_UPSIDE_DOWN:
+        return " The disc is inserted upside down; flip it and retry.";
+    case E_IMAPI_DF2DATA_RECORDER_NOT_SUPPORTED:
+        return " This recorder does not support the requested data format.";
+    default:
+        return "";
+    }
+}
+
 bool BurnImageFile(const std::string& imagePath, const std::string& devicePath,
                    const std::string& discType, int speed, int verifyLevel,
                    bool finalize, unsigned long long sessionStartBlock) {
@@ -1050,6 +1239,41 @@ bool BurnImageFile(const std::string& imagePath, const std::string& devicePath,
     }
     writer->put_Recorder(recorder.get());
     SetClientName(writer.get());
+
+    /* Fail fast when the tray is empty or the inserted medium is unusable.
+     * Without this check IMAPI2 spends a second "preparing" and then returns
+     * 0xC0AA0406 with no hint about what to do. Only refuse on an explicit
+     * VARIANT_FALSE: if the query itself fails, let Write() decide so a
+     * quirky recorder is never blocked by a diagnostic call. */
+    IMAPI_MEDIA_PHYSICAL_TYPE mt = IMAPI_MEDIA_TYPE_UNKNOWN;
+    HRESULT mediaHr = writer->get_CurrentPhysicalMediaType(&mt);
+    for (int attempt = 0; attempt < 3 && FAILED(mediaHr) &&
+         IsTransientMediaHr(mediaHr); ++attempt) {
+        Sleep(500);
+        mediaHr = writer->get_CurrentPhysicalMediaType(&mt);
+    }
+    VARIANT_BOOL mediaOk = VARIANT_FALSE;
+    const HRESULT mediaCheck =
+        writer->IsCurrentMediaSupported(recorder.get(), &mediaOk);
+    if (SUCCEEDED(mediaCheck) && mediaOk != VARIANT_TRUE) {
+        SetBurnLastError("No writable disc detected in " + devicePath +
+                         "; insert a blank CD-R/DVD-R or a rewritable disc. "
+                         "IMAPI2 IsCurrentMediaSupported returned false; " +
+                         "physical media query " + HrHex(mediaHr) +
+                         " (" + MediaTypeName(mt) + "). See Burn_GetMediaState().");
+        return false;
+    }
+
+    /* Randomly writable media (DVD-RAM / DVD+RW) is never blank: IMAPI2
+     * reports OVERWRITE_ONLY and Write() returns
+     * E_IMAPI_DF2DATA_MEDIA_NOT_BLANK unless ForceOverwrite is enabled.
+     * Only enable it for that media state, never for ordinary sequential
+     * media, so a non-blank CD-R / DVD-R is still refused. */
+    IMAPI_FORMAT2_DATA_MEDIA_STATE mediaState = IMAPI_FORMAT2_DATA_MEDIA_STATE_UNKNOWN;
+    if (SUCCEEDED(writer->get_CurrentMediaStatus(&mediaState)) &&
+        (mediaState & IMAPI_FORMAT2_DATA_MEDIA_STATE_OVERWRITE_ONLY)) {
+        writer->put_ForceOverwrite(VARIANT_TRUE);
+    }
 
     /* Default IMAPI2 behaviour already leaves a sequential disc appendable;
      * closing it is an explicit request. */
@@ -1109,7 +1333,7 @@ bool BurnImageFile(const std::string& imagePath, const std::string& devicePath,
         return false;
     }
     SetBurnLastError("Burn write failed (" + HrHex(hr) + ") for " + imagePath +
-                     " on " + devicePath);
+                     " on " + devicePath + "." + WriteFailureHint(hr));
     return false;
 }
 
@@ -1425,7 +1649,7 @@ bool BurnRawImage(const std::string& imagePath, const std::string& devicePath,
     bool pqSupported = false;
     for (LONG k = (LONG)types.lower(); k <= (LONG)types.upper(); ++k) {
         LONG v = 0;
-        if (SUCCEEDED(SafeArrayGetElement(types.get(), &k, &v)) &&
+        if (ReadLongElement(types.get(), k, v) &&
             v == (LONG)IMAPI_FORMAT2_RAW_CD_SUBCODE_PQ_ONLY) {
             pqSupported = true;
         }
@@ -1777,12 +2001,239 @@ static void AppendProfileArray(std::string& out, SAFEARRAY* arr, const std::stri
     out += label + ":";
     for (LONG k = lb; k <= ub; ++k) {
         LONG v = -1;
-        if (SUCCEEDED(SafeArrayGetElement(arr, &k, &v))) {
+        if (ReadLongElement(arr, k, v)) {
             out += " ";
             out += ProfileName(v);
         }
     }
     out += "\n";
+}
+
+/* --------------------------------------------------------------------------
+ * Inserted-media identification
+ *
+ * IDiscFormat2Data::get_CurrentPhysicalMediaType is the IMAPI2 property that
+ * names the disc itself. get_CurrentProfiles is NOT a substitute: it lists
+ * the feature profiles the drive currently advertises, which can contain
+ * several entries at once. Bind a data writer to the recorder exactly like
+ * DriveInformation() does, then read the one physical media type.
+ * ------------------------------------------------------------------------ */
+static bool QueryPhysicalMediaType(const std::string& devicePath,
+                                   IMAPI_MEDIA_PHYSICAL_TYPE* outType) {
+    if (!outType) return false;
+    *outType = IMAPI_MEDIA_TYPE_UNKNOWN;
+    Bstr id;
+    if (!FindRecorderId(devicePath, id)) return false;
+    Com<IDiscRecorder2> recorder = OpenRecorder(id);
+    if (!recorder) return false;
+
+    Com<IDiscFormat2Data> writer;
+    HRESULT hr = CoCreateInstance(CLSID_MsftDiscFormat2Data, nullptr,
+                                  CLSCTX_INPROC_SERVER, IID_IDiscFormat2Data,
+                                  (void**)&writer);
+    if (FAILED(hr) || !writer) {
+        SetBurnLastError(HrMsg(hr, "CoCreateInstance(IDiscFormat2Data)"));
+        return false;
+    }
+    writer->put_Recorder(recorder.get());
+    SetClientName(writer.get());
+    hr = writer->get_CurrentPhysicalMediaType(outType);
+    if (FAILED(hr)) {
+        SetBurnLastError(HrMsg(hr, "get_CurrentPhysicalMediaType") +
+                         " for " + devicePath);
+        return false;
+    }
+    return true;
+}
+
+/* Map IMAPI2's physical media enum onto the backend-independent BURN_MEDIA_*
+ * codes declared in the public header. */
+static int MediaTypeCodeFrom(IMAPI_MEDIA_PHYSICAL_TYPE mt) {
+    switch (mt) {
+    case IMAPI_MEDIA_TYPE_CDROM: return BURN_MEDIA_CD_ROM;
+    case IMAPI_MEDIA_TYPE_CDR: return BURN_MEDIA_CD_R;
+    case IMAPI_MEDIA_TYPE_CDRW:
+    case IMAPI_MEDIA_TYPE_DISK: return BURN_MEDIA_CD_RW;
+    case IMAPI_MEDIA_TYPE_DVDROM: return BURN_MEDIA_DVD_ROM;
+    case IMAPI_MEDIA_TYPE_DVDDASHR: return BURN_MEDIA_DVD_R;
+    case IMAPI_MEDIA_TYPE_DVDDASHRW: return BURN_MEDIA_DVD_RW;
+    case IMAPI_MEDIA_TYPE_DVDPLUSR: return BURN_MEDIA_DVD_PLUS_R;
+    case IMAPI_MEDIA_TYPE_DVDPLUSRW: return BURN_MEDIA_DVD_PLUS_RW;
+    case IMAPI_MEDIA_TYPE_DVDRAM: return BURN_MEDIA_DVD_RAM;
+    case IMAPI_MEDIA_TYPE_DVDPLUSR_DUALLAYER:
+    case IMAPI_MEDIA_TYPE_DVDDASHR_DUALLAYER:
+    case IMAPI_MEDIA_TYPE_DVDPLUSRW_DUALLAYER: return BURN_MEDIA_DVD_DL;
+    case IMAPI_MEDIA_TYPE_BDROM: return BURN_MEDIA_BD_ROM;
+    case IMAPI_MEDIA_TYPE_BDR: return BURN_MEDIA_BD_R;
+    case IMAPI_MEDIA_TYPE_BDRE: return BURN_MEDIA_BD_RE;
+    case IMAPI_MEDIA_TYPE_HDDVDROM:
+    case IMAPI_MEDIA_TYPE_HDDVDR:
+    case IMAPI_MEDIA_TYPE_HDDVDRAM: return BURN_MEDIA_HD_DVD;
+    case IMAPI_MEDIA_TYPE_UNKNOWN: return BURN_MEDIA_UNKNOWN;
+    default: return BURN_MEDIA_OTHER;
+    }
+}
+
+std::string MediaType(const std::string& devicePath) {
+    IMAPI_MEDIA_PHYSICAL_TYPE mt = IMAPI_MEDIA_TYPE_UNKNOWN;
+    if (!QueryPhysicalMediaType(devicePath, &mt)) return "";
+    return MediaTypeName(mt);
+}
+
+int MediaTypeCode(const std::string& devicePath) {
+    IMAPI_MEDIA_PHYSICAL_TYPE mt = IMAPI_MEDIA_TYPE_UNKNOWN;
+    if (!QueryPhysicalMediaType(devicePath, &mt)) return BURN_MEDIA_UNKNOWN;
+    return MediaTypeCodeFrom(mt);
+}
+
+/* A physical drive needs a moment after a disc is inserted. IMAPI2 reports
+ * these HRESULTs while it spins up or re-reads the medium; a bounded retry
+ * keeps a perfectly good burner from being reported as unusable. */
+static bool IsTransientMediaHr(HRESULT hr) {
+    switch (hr) {
+    case E_IMAPI_RECORDER_MEDIA_BECOMING_READY:
+    case E_IMAPI_RECORDER_MEDIA_FORMAT_IN_PROGRESS:
+    case E_IMAPI_RECORDER_MEDIA_INCOMPATIBLE:
+    case E_IMAPI_RECORDER_MEDIA_NO_MEDIA:
+        return true;
+    default:
+        return false;
+    }
+}
+
+/* --------------------------------------------------------------------------
+ * Media readiness
+ *
+ * A recorder that initialises successfully is NOT necessarily able to burn:
+ * a real drive with an empty tray has no medium, and IMAPI2 only reports that
+ * at Write() time as E_IMAPI_DF2DATA_MEDIA_IS_NOT_SUPPORTED (0xC0AA0406).
+ * Combine three independent IMAPI2 facts so callers can decide up front:
+ *   - get_CurrentPhysicalMediaType: is a recognisable disc in the drive?
+ *   - IsCurrentMediaSupported: does the recorder accept this medium?
+ *   - get_CurrentMediaStatus: blank / appendable / rewritable / blocked?
+ * All three are read-only. Returns -1 only when the recorder cannot be
+ * resolved at all; otherwise a BURN_MEDIA_STATE_* bitmask.
+ * ------------------------------------------------------------------------ */
+static int QueryMediaState(const std::string& devicePath, std::string* outText) {
+    if (outText) outText->clear();
+
+    Bstr id;
+    if (!FindRecorderId(devicePath, id)) {
+        if (outText) {
+            *outText = "Recorder not found for " + devicePath +
+                       "; use ListBurningDevices() to list valid device paths";
+        }
+        return -1;
+    }
+    Com<IDiscRecorder2> recorder = OpenRecorder(id);
+    if (!recorder) {
+        if (outText) {
+            *outText = "Recorder for " + devicePath +
+                       " could not be opened (busy or write-protected driver)";
+        }
+        return -1;
+    }
+
+    int state = BURN_MEDIA_STATE_RECORDER_OK;
+    Com<IDiscFormat2Data> writer;
+    HRESULT hr = CoCreateInstance(CLSID_MsftDiscFormat2Data, nullptr,
+                                  CLSCTX_INPROC_SERVER, IID_IDiscFormat2Data,
+                                  (void**)&writer);
+    if (FAILED(hr) || !writer) {
+        if (outText) *outText = HrMsg(hr, "CoCreateInstance(IDiscFormat2Data)");
+        return state;
+    }
+    writer->put_Recorder(recorder.get());
+    SetClientName(writer.get());
+
+    IMAPI_MEDIA_PHYSICAL_TYPE mt = IMAPI_MEDIA_TYPE_UNKNOWN;
+    HRESULT mediaHr = writer->get_CurrentPhysicalMediaType(&mt);
+    for (int attempt = 0; attempt < 3 &&
+         (FAILED(mediaHr) && IsTransientMediaHr(mediaHr)); ++attempt) {
+        Sleep(500);
+        mediaHr = writer->get_CurrentPhysicalMediaType(&mt);
+    }
+    if (SUCCEEDED(mediaHr) && mt != IMAPI_MEDIA_TYPE_UNKNOWN) {
+        state |= BURN_MEDIA_STATE_MEDIA_PRESENT;
+    }
+
+    VARIANT_BOOL supported = VARIANT_FALSE;
+    const HRESULT supportHr =
+        writer->IsCurrentMediaSupported(recorder.get(), &supported);
+    if (SUCCEEDED(supportHr) && supported == VARIANT_TRUE) {
+        state |= BURN_MEDIA_STATE_MEDIA_SUPPORTED;
+    }
+
+    IMAPI_FORMAT2_DATA_MEDIA_STATE ms = IMAPI_FORMAT2_DATA_MEDIA_STATE_UNKNOWN;
+    const HRESULT statusHr = writer->get_CurrentMediaStatus(&ms);
+    if (SUCCEEDED(statusHr)) {
+        if (ms & IMAPI_FORMAT2_DATA_MEDIA_STATE_BLANK)
+            state |= BURN_MEDIA_STATE_BLANK;
+        if (ms & IMAPI_FORMAT2_DATA_MEDIA_STATE_APPENDABLE)
+            state |= BURN_MEDIA_STATE_APPENDABLE;
+        if (ms & IMAPI_FORMAT2_DATA_MEDIA_STATE_OVERWRITE_ONLY)
+            state |= BURN_MEDIA_STATE_OVERWRITE_ONLY;
+        if (ms & IMAPI_FORMAT2_DATA_MEDIA_STATE_WRITE_PROTECTED)
+            state |= BURN_MEDIA_STATE_WRITE_PROTECTED;
+        if (ms & IMAPI_FORMAT2_DATA_MEDIA_STATE_FINALIZED)
+            state |= BURN_MEDIA_STATE_FINALIZED;
+        if (ms & IMAPI_FORMAT2_DATA_MEDIA_STATE_DAMAGED)
+            state |= BURN_MEDIA_STATE_DAMAGED;
+        if (ms & IMAPI_FORMAT2_DATA_MEDIA_STATE_ERASE_REQUIRED)
+            state |= BURN_MEDIA_STATE_ERASE_REQUIRED;
+    }
+
+    const int writableStates = BURN_MEDIA_STATE_BLANK |
+                               BURN_MEDIA_STATE_APPENDABLE |
+                               BURN_MEDIA_STATE_OVERWRITE_ONLY;
+    const int blockingStates = BURN_MEDIA_STATE_WRITE_PROTECTED |
+                               BURN_MEDIA_STATE_FINALIZED |
+                               BURN_MEDIA_STATE_DAMAGED;
+    const bool ready = (state & BURN_MEDIA_STATE_MEDIA_PRESENT) != 0 &&
+                       (state & BURN_MEDIA_STATE_MEDIA_SUPPORTED) != 0 &&
+                       (state & writableStates) != 0 &&
+                       (state & blockingStates) == 0;
+    if (ready) state |= BURN_MEDIA_STATE_READY;
+
+    if (outText) {
+        if (ready) {
+            *outText = "Ready: " + MediaTypeName(mt) +
+                       " is blank, appendable or rewritable";
+        } else if (!(state & BURN_MEDIA_STATE_MEDIA_PRESENT)) {
+            *outText = "No writable disc detected in " + devicePath +
+                       "; insert a blank CD-R/DVD-R or a rewritable disc "
+                       "(IMAPI2 " + HrHex(mediaHr) + ")";
+        } else if (state & BURN_MEDIA_STATE_WRITE_PROTECTED) {
+            *outText = "The disc is write-protected; remove the write "
+                       "protection or use another disc";
+        } else if (state & BURN_MEDIA_STATE_FINALIZED) {
+            *outText = "The disc is finalized and cannot accept more data; "
+                       "use a blank disc";
+        } else if (state & BURN_MEDIA_STATE_DAMAGED) {
+            *outText = "The disc is damaged or unreadable; use another disc";
+        } else if (!(state & BURN_MEDIA_STATE_MEDIA_SUPPORTED)) {
+            *outText = "The inserted medium is not supported for data "
+                       "burning; use a blank CD-R/DVD-R (IMAPI2 " +
+                       HrHex(supportHr) + ")";
+        } else if (!(state & writableStates)) {
+            *outText = "The disc is neither blank, appendable nor "
+                       "rewritable; erase it or insert a blank disc";
+        } else {
+            *outText = "The drive is not ready for writing (media status " +
+                       HrHex(statusHr) + ")";
+        }
+    }
+    return state;
+}
+
+int MediaState(const std::string& devicePath) {
+    return QueryMediaState(devicePath, nullptr);
+}
+
+std::string MediaStateText(const std::string& devicePath) {
+    std::string text;
+    (void)QueryMediaState(devicePath, &text);
+    return text;
 }
 
 std::string DriveInformation(const std::string& devicePath) {
@@ -1807,11 +2258,8 @@ std::string DriveInformation(const std::string& devicePath) {
         if (SUCCEEDED(recorder->get_VolumePathNames(paths.out())) && paths.get()) {
             out += "volumePaths:";
             for (LONG k = (LONG)paths.lower(); k <= (LONG)paths.upper(); ++k) {
-                BSTR vp = nullptr;
-                if (SUCCEEDED(SafeArrayGetElement(paths.get(), &k, &vp)) && vp) {
-                    out += " " + BstrToUtf8(vp);
-                    SysFreeString(vp);
-                }
+                const std::string vp = VolumePathAt(paths.get(), k);
+                if (!vp.empty()) out += " " + vp;
             }
             out += "\n";
         }
@@ -1909,7 +2357,7 @@ std::string DriveInformation(const std::string& devicePath) {
             out += "supportedWriteSpeeds:";
             for (LONG k = (LONG)speeds.lower(); k <= (LONG)speeds.upper(); ++k) {
                 LONG v = 0;
-                if (SUCCEEDED(SafeArrayGetElement(speeds.get(), &k, &v))) {
+                if (ReadLongElement(speeds.get(), k, v)) {
                     char b[24];
                     snprintf(b, sizeof(b), " %ld", (long)(base > 0 ? v / base : v));
                     out += b;

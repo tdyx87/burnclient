@@ -55,6 +55,14 @@ int EjectTray(const std::string& devicePath);
 int CloseTray(const std::string& devicePath);
 std::string DriveInformation(const std::string& devicePath);
 
+/* Physical disc currently inserted: short name and BURN_MEDIA_* code. */
+std::string MediaType(const std::string& devicePath);
+int MediaTypeCode(const std::string& devicePath);
+
+/* Live BURN_MEDIA_STATE_* bitmask (or -1) and a short reason sentence. */
+int MediaState(const std::string& devicePath);
+std::string MediaStateText(const std::string& devicePath);
+
 } /* namespace burnwin */
 
 #endif /* _WIN32 */

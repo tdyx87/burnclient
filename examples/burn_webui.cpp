@@ -268,15 +268,54 @@ std::string HandleDevices() {
     if (ListBurningDevices(&devices, &count) == BURN_SUCCESS) {
         for (int i = 0; i < count; ++i) {
             if (i) out += ",";
+            /* "media" is the legacy device class ("CD/DVD"). "mediaType" is
+             * the physical disc actually in the drive, e.g. "DVD+RW". */
+            const char* disc = Burn_GetMediaType(devices[i].devicePath);
+            const int discCode = Burn_GetMediaTypeCode(devices[i].devicePath);
+            /* Media readiness is a separate question from disc type: a real
+             * recorder with an empty tray enumerates fine but cannot burn. */
+            const int state = Burn_GetMediaState(devices[i].devicePath);
+            const char* reason = Burn_GetMediaStateText(devices[i].devicePath);
+            const bool ready = state > 0 &&
+                               (state & BURN_MEDIA_STATE_READY) != 0;
             out += "{\"path\":" + JsonString(devices[i].devicePath) +
                    ",\"name\":" + JsonString(devices[i].deviceName) +
                    ",\"media\":" + JsonString(devices[i].mediaType) +
                    ",\"writable\":" + (devices[i].isWritable ? "true" : "false") +
+                   ",\"ready\":" + (ready ? "true" : "false") +
+                   ",\"state\":" + std::to_string(state) +
+                   ",\"reason\":" + JsonString(reason ? reason : "") +
+                   ",\"mediaType\":" + JsonString(disc ? disc : "") +
+                   ",\"mediaCode\":" + std::to_string(discCode) +
                    "}";
         }
         FreeDeviceList(devices, count);
     }
     out += "]}";
+    return out;
+}
+
+/* Structured query for the disc currently in one drive. */
+std::string HandleMedia(const Request& r) {
+    const std::string device = Field(r, "device");
+    if (device.empty()) {
+        return "{\"ok\":false,\"error\":\"device is required\"}";
+    }
+    const char* name = Burn_GetMediaType(device.c_str());
+    const int code = Burn_GetMediaTypeCode(device.c_str());
+    const int state = Burn_GetMediaState(device.c_str());
+    const char* reason = Burn_GetMediaStateText(device.c_str());
+    const bool ready = state > 0 && (state & BURN_MEDIA_STATE_READY) != 0;
+    std::string out = "{\"ok\":true,\"device\":" + JsonString(device) +
+                      ",\"type\":" + JsonString(name ? name : "") +
+                      ",\"code\":" + std::to_string(code) +
+                      ",\"state\":" + std::to_string(state) +
+                      ",\"ready\":" + (ready ? "true" : "false") +
+                      ",\"reason\":" + JsonString(reason ? reason : "");
+    if (!name || !*name) {
+        out += ",\"note\":" + JsonString(GetLastErrorMessage());
+    }
+    out += "}";
     return out;
 }
 
@@ -365,6 +404,16 @@ std::string HandleStart(const Request& r) {
     std::memset(&o, 0, sizeof(o));
     o.size = (int)sizeof(o);
     o.mode = j.mode;
+    /* The data-disc pane accepts a folder as well as an image file: files
+     * dropped onto the page are staged into a directory on this machine.
+     * Mode IMAGE would hand that directory to the writer as though it were
+     * an ISO, and Windows fails with 0x80070005 when asked to open a
+     * directory as a stream. Normalise it here so every client gets the
+     * ISO built from the folder first, not just our own page. */
+    if (o.mode == BURN_JOB_MODE_IMAGE && !j.sourcePath.empty() &&
+        IsDirectory(j.sourcePath)) {
+        o.mode = BURN_JOB_MODE_DIRECTORY;
+    }
     o.sourcePath = j.sourcePath.empty() ? nullptr : j.sourcePath.c_str();
     o.outputPath = j.outputPath.empty() ? nullptr : j.outputPath.c_str();
     o.devicePath = j.devicePath.empty() ? nullptr : j.devicePath.c_str();
@@ -395,6 +444,27 @@ std::string HandleStart(const Request& r) {
     if (!trackSpecs.empty()) {
         o.audioTracks = trackSpecs.data();
         o.audioTrackCount = (int)trackSpecs.size();
+    }
+
+    /* Reject a burn with no usable disc before starting a job. The library
+     * also preflights this in BurnImageFile(), but answering here gives the
+     * browser a clear reason instead of a job that fails a second later.
+     * Read-only modes (CREATE_IMAGE, SELFTEST, VERIFY, CREATE_RAW) and the
+     * erase mode have different media requirements and are left alone. */
+    if (!j.devicePath.empty() &&
+        (o.mode == BURN_JOB_MODE_IMAGE || o.mode == BURN_JOB_MODE_DIRECTORY ||
+         o.mode == BURN_JOB_MODE_APPEND)) {
+        const int state = Burn_GetMediaState(j.devicePath.c_str());
+        if (state >= 0 &&
+            !(state & BURN_MEDIA_STATE_QUERY_UNSUPPORTED) &&
+            !(state & BURN_MEDIA_STATE_READY)) {
+            const char* reason = Burn_GetMediaStateText(j.devicePath.c_str());
+            const std::string message =
+                "Device " + j.devicePath + " cannot be used for burning right now. " +
+                (reason && *reason ? reason : "No writable disc detected.");
+            return "{\"ok\":false,\"error\":" + JsonString(message) +
+                   ",\"state\":" + std::to_string(state) + "}";
+        }
     }
 
     const BurnJobHandle handle =
@@ -886,6 +956,9 @@ void HandleConnection(SOCKET_TYPE sock) {
         type = "application/json; charset=utf-8";
     } else if (req.path == "/api/driveinfo") {
         body = HandleDriveInfo(req);
+        type = "application/json; charset=utf-8";
+    } else if (req.path == "/api/media") {
+        body = HandleMedia(req);
         type = "application/json; charset=utf-8";
     } else if (req.path == "/api/session") {
         body = HandleSessionBlock(req);

@@ -37,6 +37,8 @@ static void printUsage() {
     std::cout << "Usage: burn_cli <command> [args]\n"
               << "Commands:\n"
               << "  list-devices              List available burning devices\n"
+              << "  media-type <device>       Read the inserted disc type and code\n"
+              << "  media-state <device>      Check whether the disc can be burned now\n"
               << "  platform-info            Show platform info\n"
               << "  tool-avail <tool>         Check tool availability\n"
               << "  create-iso <src> <iso> [label]   Create ISO from directory\n"
@@ -118,11 +120,36 @@ int main(int argc, char* argv[]) {
         auto devices = util.ListBurningDevices();
         std::cout << "Devices: " << devices.size() << std::endl;
         for (size_t i = 0; i < devices.size(); ++i) {
+            const char* disc = Burn_GetMediaType(devices[i].devicePath);
+            const char* reason = Burn_GetMediaStateText(devices[i].devicePath);
             std::cout << i << ": " << devices[i].devicePath << " (" << devices[i].deviceName
                       << ") type=" << devices[i].mediaType
+                      << " disc=" << (disc && *disc ? disc : "unknown")
                       << " writable=" << devices[i].isWritable
-                      << " empty=" << devices[i].isEmpty << std::endl;
+                      << " empty=" << devices[i].isEmpty
+                      << " | " << (reason && *reason ? reason : "unknown") << std::endl;
         }
+        return 0;
+    }
+    if (cmd == "media-type" && argc >= 3) {
+        const char* disc = Burn_GetMediaType(argv[2]);
+        const int code = Burn_GetMediaTypeCode(argv[2]);
+        std::cout << "device=" << argv[2]
+                  << " disc=" << (disc && *disc ? disc : "unknown")
+                  << " code=" << code << std::endl;
+        if (!disc || !*disc) {
+            std::cout << "reason: " << GetLastErrorMessage() << std::endl;
+        }
+        return 0;
+    }
+    if (cmd == "media-state" && argc >= 3) {
+        const int state = Burn_GetMediaState(argv[2]);
+        const char* text = Burn_GetMediaStateText(argv[2]);
+        std::cout << "device=" << argv[2]
+                  << " state=" << state
+                  << " ready=" << ((state > 0 && (state & BURN_MEDIA_STATE_READY)) ? 1 : 0)
+                  << std::endl;
+        std::cout << "reason: " << (text && *text ? text : "unknown") << std::endl;
         return 0;
     }
     if (cmd == "platform-info") {
@@ -196,13 +223,24 @@ int main(int argc, char* argv[]) {
             std::cout << "SKIP: no burning device on this machine" << std::endl;
             return 0;
         }
-        const DeviceInfo& dev = devices[0];
-        if (!dev.isWritable) {
-            std::cout << "SKIP: device " << dev.devicePath
-                      << " is not writable (write-protected driver or busy)"
+        /* A machine can have several optical drives; an empty tray is now
+         * reported as not writable, so pick the first usable one instead of
+         * blindly taking index 0 and skipping a perfectly good burner. */
+        size_t chosen = devices.size();
+        for (size_t i = 0; i < devices.size(); ++i) {
+            if (devices[i].isWritable) { chosen = i; break; }
+        }
+        if (chosen == devices.size()) {
+            std::cout << "SKIP: no device with a writable disc is available"
                       << std::endl;
+            for (size_t i = 0; i < devices.size(); ++i) {
+                const char* reason = Burn_GetMediaStateText(devices[i].devicePath);
+                std::cout << "  " << devices[i].devicePath << ": "
+                          << (reason && *reason ? reason : "unusable") << std::endl;
+            }
             return 0;
         }
+        const DeviceInfo& dev = devices[chosen];
 
         /* 1. temp dir with a deterministic payload */
         std::string tmpBase = ".";

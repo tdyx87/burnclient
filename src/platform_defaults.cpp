@@ -115,3 +115,23 @@ std::string IPlatform::DriveInformation(const std::string& /*devicePath*/) {
     SetBurnLastError(Unsupported("MMC drive information reporting"));
     return "";
 }
+
+std::string IPlatform::MediaType(const std::string& /*devicePath*/) {
+    SetBurnLastError(Unsupported("inserted media type reporting"));
+    return "";
+}
+
+int IPlatform::MediaTypeCode(const std::string& /*devicePath*/) {
+    SetBurnLastError(Unsupported("inserted media type reporting"));
+    return BURN_MEDIA_UNKNOWN;
+}
+
+int IPlatform::MediaState(const std::string& /*devicePath*/) {
+    SetBurnLastError(Unsupported("media readiness reporting"));
+    return BURN_MEDIA_STATE_QUERY_UNSUPPORTED;
+}
+
+std::string IPlatform::MediaStateText(const std::string& /*devicePath*/) {
+    SetBurnLastError(Unsupported("media readiness reporting"));
+    return "Media readiness reporting is not supported by this backend";
+}

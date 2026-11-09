@@ -14,6 +14,7 @@
 #include <windows.h>
 #include <winioctl.h>  /* IOCTL_DISK_IS_WRITABLE */
 #include <imapi2.h>
+#include <imapi2error.h>   /* E_IMAPI_RECORDER_MEDIA_* transient states */
 #include <imapi2fs.h>
 #include <comdef.h>
 #include <shlobj.h>
@@ -25,15 +26,20 @@
 #pragma comment(lib, "oleaut32.lib")
 #pragma comment(lib, "shlwapi.lib")
 
-/* IDiscRecorder2::get_VolumePathNames() returns a SAFEARRAY of BSTR,
- * NOT a single BSTR. Extract the first volume path as UTF-8. */
+/* IDiscRecorder2::get_VolumePathNames() returns a SAFEARRAY whose elements
+ * are VARIANT values of type VT_BSTR; the path is in bstrVal. Accept a
+ * plain SAFEARRAY(BSTR) as a compatibility fallback for other IMAPI2
+ * implementations. Extract the first volume path as UTF-8. */
 static bool GetFirstVolumePath(IDiscRecorder2* recorder, char* outBuf, size_t outSize) {
     if (!recorder || !outBuf || outSize == 0) {
         return false;
     }
+    outBuf[0] = '\0';
 
     SAFEARRAY* paths = nullptr;
-    if (FAILED(recorder->get_VolumePathNames(&paths)) || !paths) {
+    HRESULT hr = recorder->get_VolumePathNames(&paths);
+    if (FAILED(hr) || !paths) {
+        if (paths) SafeArrayDestroy(paths);
         return false;
     }
 
@@ -42,18 +48,92 @@ static bool GetFirstVolumePath(IDiscRecorder2* recorder, char* outBuf, size_t ou
     LONG upper = -1;
     if (SUCCEEDED(SafeArrayGetLBound(paths, 1, &lower)) &&
         SUCCEEDED(SafeArrayGetUBound(paths, 1, &upper)) && upper >= lower) {
-        BSTR first = nullptr;
-        if (SUCCEEDED(SafeArrayGetElement(paths, &lower, &first)) && first) {
-            WideCharToMultiByte(CP_UTF8, 0, first, -1, outBuf,
-                                static_cast<int>(outSize - 1), nullptr, nullptr);
-            outBuf[outSize - 1] = '\0';
-            SysFreeString(first);
-            ok = true;
+        const UINT elemSize = SafeArrayGetElemsize(paths);
+        VARTYPE elemType = VT_EMPTY;
+        if (FAILED(SafeArrayGetVartype(paths, &elemType))) {
+            elemType = VT_EMPTY;
+        }
+        /* The physical element size is authoritative: a SAFEARRAY(VARIANT)
+         * is 16 bytes on x64 while a SAFEARRAY(BSTR) is 8 bytes. */
+        if (elemSize == sizeof(VARIANT)) {
+            elemType = VT_VARIANT;
+        } else if (elemSize == sizeof(BSTR)) {
+            elemType = VT_BSTR;
+        }
+
+        if (elemType == VT_VARIANT) {
+            VARIANT value;
+            VariantInit(&value);
+            if (SUCCEEDED(SafeArrayGetElement(paths, &lower, &value)) &&
+                value.vt == VT_BSTR && value.bstrVal) {
+                WideCharToMultiByte(CP_UTF8, 0, value.bstrVal, -1, outBuf,
+                                    static_cast<int>(outSize - 1), nullptr, nullptr);
+                outBuf[outSize - 1] = '\0';
+                ok = true;
+            }
+            VariantClear(&value);
+        } else if (elemType == VT_BSTR) {
+            BSTR first = nullptr;
+            if (SUCCEEDED(SafeArrayGetElement(paths, &lower, &first)) && first) {
+                WideCharToMultiByte(CP_UTF8, 0, first, -1, outBuf,
+                                    static_cast<int>(outSize - 1), nullptr, nullptr);
+                outBuf[outSize - 1] = '\0';
+                SysFreeString(first);
+                ok = true;
+            }
         }
     }
 
     SafeArrayDestroy(paths);
     return ok;
+}
+
+/* IDiscFormat2Data::get_SupportedWriteSpeedDescriptors() returns a
+ * SAFEARRAY(VARIANT) with VT_DISPATCH elements. Accept a plain
+ * SAFEARRAY(IDispatch*) as a compatibility fallback. The returned pointer
+ * owns one reference. */
+static bool GetDispatchElement(SAFEARRAY* arr, LONG index, IDispatch** out) {
+    if (!out) return false;
+    *out = nullptr;
+    if (!arr) return false;
+
+    const UINT elemSize = SafeArrayGetElemsize(arr);
+    VARTYPE vt = VT_EMPTY;
+    if (FAILED(SafeArrayGetVartype(arr, &vt))) {
+        vt = VT_EMPTY;
+    }
+    if (elemSize == sizeof(VARIANT)) {
+        VARIANT value;
+        VariantInit(&value);
+        bool ok = false;
+        if (SUCCEEDED(SafeArrayGetElement(arr, &index, &value))) {
+            IUnknown* unk = nullptr;
+            if (value.vt == VT_DISPATCH && value.pdispVal) unk = value.pdispVal;
+            else if (value.vt == VT_UNKNOWN && value.punkVal) unk = value.punkVal;
+            if (unk && SUCCEEDED(unk->QueryInterface(IID_IDispatch, (void**)out))) {
+                ok = true;
+            }
+        }
+        VariantClear(&value);
+        return ok;
+    }
+    if (elemSize == sizeof(IDispatch*) && vt == VT_UNKNOWN) {
+        IUnknown* unk = nullptr;
+        if (SUCCEEDED(SafeArrayGetElement(arr, &index, &unk)) && unk) {
+            const bool ok = SUCCEEDED(unk->QueryInterface(IID_IDispatch, (void**)out));
+            unk->Release();
+            return ok;
+        }
+        return false;
+    }
+    if (elemSize == sizeof(IDispatch*) && (vt == VT_DISPATCH || vt == VT_EMPTY)) {
+        IDispatch* d = nullptr;
+        if (SUCCEEDED(SafeArrayGetElement(arr, &index, &d)) && d) {
+            *out = d;
+            return true;
+        }
+    }
+    return false;
 }
 
 /* ---------------------------------------------------------------------------
@@ -223,6 +303,79 @@ static bool FindUnclaimedCdromLetter(std::vector<std::string>& claimed,
     return false;
 }
 
+/* Read-only IMAPI2 check on an already opened recorder: is there a usable
+ * writable disc in the drive? InitializeDiscRecorder() succeeds for a drive
+ * with an empty tray, so listing it as writable sends callers into Write()
+ * where IMAPI2 fails with 0xC0AA0406. Return a BURN_MEDIA_STATE_* bitmask
+ * so DeviceInfo can report the truth. */
+static int ProbeMediaState(IDiscRecorder2* recorder) {
+    if (!recorder) return 0;
+    IDiscFormat2Data* writer = nullptr;
+    HRESULT hr = CoCreateInstance(CLSID_MsftDiscFormat2Data, nullptr,
+                                  CLSCTX_INPROC_SERVER, IID_IDiscFormat2Data,
+                                  (void**)&writer);
+    if (FAILED(hr) || !writer) {
+        if (writer) writer->Release();
+        return 0;
+    }
+
+    int state = BURN_MEDIA_STATE_RECORDER_OK;
+    writer->put_Recorder(recorder);
+
+    IMAPI_MEDIA_PHYSICAL_TYPE mt = IMAPI_MEDIA_TYPE_UNKNOWN;
+    HRESULT mediaHr = writer->get_CurrentPhysicalMediaType(&mt);
+    /* A real drive answers BECOMING_READY / INCOMPATIBLE / NO_MEDIA for a
+     * short while after insertion. Retry briefly before declaring the tray
+     * empty, so list-devices does not hide a usable burner. */
+    for (int attempt = 0; attempt < 3 && FAILED(mediaHr) &&
+         (mediaHr == E_IMAPI_RECORDER_MEDIA_BECOMING_READY ||
+          mediaHr == E_IMAPI_RECORDER_MEDIA_FORMAT_IN_PROGRESS ||
+          mediaHr == E_IMAPI_RECORDER_MEDIA_INCOMPATIBLE ||
+          mediaHr == E_IMAPI_RECORDER_MEDIA_NO_MEDIA); ++attempt) {
+        Sleep(500);
+        mediaHr = writer->get_CurrentPhysicalMediaType(&mt);
+    }
+    if (SUCCEEDED(mediaHr) && mt != IMAPI_MEDIA_TYPE_UNKNOWN) {
+        state |= BURN_MEDIA_STATE_MEDIA_PRESENT;
+    }
+
+    VARIANT_BOOL supported = VARIANT_FALSE;
+    if (SUCCEEDED(writer->IsCurrentMediaSupported(recorder, &supported)) &&
+        supported == VARIANT_TRUE) {
+        state |= BURN_MEDIA_STATE_MEDIA_SUPPORTED;
+    }
+
+    IMAPI_FORMAT2_DATA_MEDIA_STATE ms = IMAPI_FORMAT2_DATA_MEDIA_STATE_UNKNOWN;
+    if (SUCCEEDED(writer->get_CurrentMediaStatus(&ms))) {
+        if (ms & IMAPI_FORMAT2_DATA_MEDIA_STATE_BLANK)
+            state |= BURN_MEDIA_STATE_BLANK;
+        if (ms & IMAPI_FORMAT2_DATA_MEDIA_STATE_APPENDABLE)
+            state |= BURN_MEDIA_STATE_APPENDABLE;
+        if (ms & IMAPI_FORMAT2_DATA_MEDIA_STATE_OVERWRITE_ONLY)
+            state |= BURN_MEDIA_STATE_OVERWRITE_ONLY;
+        if (ms & IMAPI_FORMAT2_DATA_MEDIA_STATE_WRITE_PROTECTED)
+            state |= BURN_MEDIA_STATE_WRITE_PROTECTED;
+        if (ms & IMAPI_FORMAT2_DATA_MEDIA_STATE_FINALIZED)
+            state |= BURN_MEDIA_STATE_FINALIZED;
+        if (ms & IMAPI_FORMAT2_DATA_MEDIA_STATE_DAMAGED)
+            state |= BURN_MEDIA_STATE_DAMAGED;
+    }
+    writer->Release();
+
+    const int writableStates = BURN_MEDIA_STATE_BLANK |
+                               BURN_MEDIA_STATE_APPENDABLE |
+                               BURN_MEDIA_STATE_OVERWRITE_ONLY;
+    const int blockingStates = BURN_MEDIA_STATE_WRITE_PROTECTED |
+                               BURN_MEDIA_STATE_FINALIZED |
+                               BURN_MEDIA_STATE_DAMAGED;
+    if ((state & BURN_MEDIA_STATE_MEDIA_PRESENT) &&
+        (state & BURN_MEDIA_STATE_MEDIA_SUPPORTED) &&
+        (state & writableStates) && !(state & blockingStates)) {
+        state |= BURN_MEDIA_STATE_READY;
+    }
+    return state;
+}
+
 class WindowsPlatform : public IPlatform {
 public:
     WindowsPlatform() {
@@ -265,8 +418,11 @@ public:
                         hr = pRecorder->InitializeDiscRecorder(uniqueId);
                         if (SUCCEEDED(hr)) {
                             DeviceInfo info = {};
-                            info.isWritable = 1;
-                            info.isEmpty = 1;
+                            const int mediaState = ProbeMediaState(pRecorder);
+                            info.isWritable =
+                                (mediaState & BURN_MEDIA_STATE_READY) ? 1 : 0;
+                            info.isEmpty =
+                                (mediaState & BURN_MEDIA_STATE_BLANK) ? 1 : 0;
                             strncpy(info.mediaType, "CD/DVD", sizeof(info.mediaType) - 1);
 
                             if (!GetFirstVolumePath(pRecorder, info.devicePath,
@@ -298,7 +454,7 @@ public:
                             wchar_t* devIf = reinterpret_cast<wchar_t*>(uniqueId);
                             info.isWritable =
                                 ProbeDeviceWritable(devIf) ? 1 : 0;
-                            info.isEmpty = 1;
+                            info.isEmpty = 0;  /* unknown: recorder not open */
                             strncpy(info.mediaType, "CD/DVD", sizeof(info.mediaType) - 1);
                             if (!FindUnclaimedCdromLetter(claimedPaths, info.devicePath,
                                                           sizeof(info.devicePath))) {
@@ -435,7 +591,7 @@ public:
                 if (SUCCEEDED(SafeArrayGetLBound(descs, 1, &lb)) &&
                     SUCCEEDED(SafeArrayGetUBound(descs, 1, &ub)) && ub >= lb) {
                     IDispatch* d = nullptr;
-                    if (SUCCEEDED(SafeArrayGetElement(descs, &lb, &d)) && d) {
+                    if (GetDispatchElement(descs, lb, &d) && d) {
                         IWriteSpeedDescriptor* wsd = nullptr;
                         if (SUCCEEDED(d->QueryInterface(__uuidof(IWriteSpeedDescriptor),
                                                         (void**)&wsd)) && wsd) {
@@ -628,6 +784,18 @@ public:
 
     std::string DriveInformation(const std::string& devicePath) override {
         return burnwin::DriveInformation(devicePath);
+    }
+    std::string MediaType(const std::string& devicePath) override {
+        return burnwin::MediaType(devicePath);
+    }
+    int MediaTypeCode(const std::string& devicePath) override {
+        return burnwin::MediaTypeCode(devicePath);
+    }
+    int MediaState(const std::string& devicePath) override {
+        return burnwin::MediaState(devicePath);
+    }
+    std::string MediaStateText(const std::string& devicePath) override {
+        return burnwin::MediaStateText(devicePath);
     }
 
     bool CheckToolAvailability(const std::string& toolName) override {

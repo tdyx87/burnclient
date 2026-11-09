@@ -708,6 +708,98 @@ static void TestDeviceResolution() {
     CHECK(Burn_GetDriveInformation(bogus) != nullptr);
 }
 
+/* Inserted-media identification: reject bad input without crashing, and
+ * keep the human-readable name and the BURN_MEDIA_* code consistent on any
+ * recorder the machine happens to have. Hardware-free CI still exercises
+ * the whole parameter-validation half. */
+static void TestMediaTypeQuery() {
+    std::printf("\n=== Inserted media type query ===\n");
+
+    const char* nullType = Burn_GetMediaType(nullptr);
+    CHECK(nullType != nullptr);
+    CHECK(nullType[0] == '\0');
+    CHECK(Burn_GetMediaTypeCode(nullptr) == BURN_MEDIA_UNKNOWN);
+    CHECK(Burn_GetMediaType("") != nullptr);
+    CHECK(std::strlen(Burn_GetMediaType("")) == 0);
+    CHECK(Burn_GetMediaTypeCode("") == BURN_MEDIA_UNKNOWN);
+
+    const char* bogus = "Z:\\no-such-recorder";
+    const char* bogusType = Burn_GetMediaType(bogus);
+    CHECK(bogusType != nullptr);
+    CHECK(bogusType[0] == '\0');
+    CHECK(Burn_GetMediaTypeCode(bogus) == BURN_MEDIA_UNKNOWN);
+    INFO("  bogus device -> code=%d\n", Burn_GetMediaTypeCode(bogus));
+
+    DeviceInfo* devices = nullptr;
+    int count = 0;
+    if (ListBurningDevices(&devices, &count) == BURN_SUCCESS && count > 0) {
+        for (int i = 0; i < count; ++i) {
+            const char* name = Burn_GetMediaType(devices[i].devicePath);
+            const int code = Burn_GetMediaTypeCode(devices[i].devicePath);
+            INFO("  %s -> '%s' (code %d)\n", devices[i].devicePath,
+                 name ? name : "(null)", code);
+            CHECK(name != nullptr);
+            CHECK(code >= BURN_MEDIA_UNKNOWN && code <= BURN_MEDIA_OTHER);
+            if (code != BURN_MEDIA_UNKNOWN) CHECK(name[0] != '\0');
+            if (name && name[0] != '\0') CHECK(code != BURN_MEDIA_UNKNOWN);
+        }
+        FreeDeviceList(devices, count);
+    } else {
+        INFO("  no recorder present: real-media assertions SKIPPED\n");
+    }
+}
+
+/* A recorder that initialises is not necessarily usable: a real drive with
+ * an empty tray must be reported as not READY, with an actionable reason.
+ * This is what prevents the Web UI from offering it for a burn that fails
+ * later with 0xC0AA0406. */
+static void TestMediaStateQuery() {
+    std::printf("\n=== Media readiness query ===\n");
+
+    CHECK(Burn_GetMediaState(nullptr) == -1);
+    CHECK(Burn_GetMediaState("") == -1);
+    const char* emptyText = Burn_GetMediaStateText(nullptr);
+    CHECK(emptyText != nullptr);
+    CHECK(emptyText[0] != '\0');
+
+    const char* bogus = "Z:\\no-such-recorder";
+    CHECK(Burn_GetMediaState(bogus) == -1);
+    const char* bogusText = Burn_GetMediaStateText(bogus);
+    CHECK(bogusText != nullptr);
+    CHECK(bogusText[0] != '\0');
+    INFO("  bogus device -> %d, '%s'\n", Burn_GetMediaState(bogus), bogusText);
+
+    DeviceInfo* devices = nullptr;
+    int count = 0;
+    if (ListBurningDevices(&devices, &count) == BURN_SUCCESS && count > 0) {
+        for (int i = 0; i < count; ++i) {
+            const int state = Burn_GetMediaState(devices[i].devicePath);
+            const char* reason = Burn_GetMediaStateText(devices[i].devicePath);
+            INFO("  %s -> state=%d ready=%d writable=%d : %s\n",
+                 devices[i].devicePath, state,
+                 (state > 0 && (state & BURN_MEDIA_STATE_READY)) ? 1 : 0,
+                 devices[i].isWritable, reason ? reason : "(null)");
+            CHECK(state >= 0);
+            CHECK(reason != nullptr);
+            CHECK(reason[0] != '\0');
+            /* isWritable must agree with the structured readiness query:
+             * this is the invariant that stops empty trays being offered. */
+            const bool ready = state > 0 &&
+                               (state & BURN_MEDIA_STATE_READY) != 0 &&
+                               (state & BURN_MEDIA_STATE_QUERY_UNSUPPORTED) == 0;
+            if ((state & BURN_MEDIA_STATE_QUERY_UNSUPPORTED) == 0) {
+                CHECK((devices[i].isWritable != 0) == ready);
+            }
+            if (devices[i].isEmpty) {
+                CHECK((state & BURN_MEDIA_STATE_BLANK) != 0);
+            }
+        }
+        FreeDeviceList(devices, count);
+    } else {
+        INFO("  no recorder present: readiness assertions SKIPPED\n");
+    }
+}
+
 /* ------------------------------------------------------------------------ */
 int main() {
     /* Unbuffered: if a capability path crashes we still see how far it got. */
@@ -722,6 +814,8 @@ int main() {
     TestRawImageBytes();
     TestUdfAndBootBytes();
     TestDeviceResolution();
+    TestMediaTypeQuery();
+    TestMediaStateQuery();
 
     /* Remove the tree; ignore failures on a non-empty dir. */
     remove(Join(kWorkDir, "disc.raw").c_str());

@@ -1502,6 +1502,88 @@ const char* Burn_GetDriveInformation(const char* devicePath) {
     }
 }
 
+const char* Burn_GetMediaType(const char* devicePath) {
+    static thread_local std::string result;
+    try {
+        result.clear();
+        if (!devicePath || !devicePath[0]) {
+            SetBurnLastError("Burn_GetMediaType: devicePath is required");
+            return result.c_str();
+        }
+        IPlatform* platform = GetPlatform();
+        if (!platform) {
+            SetBurnLastError("Burn_GetMediaType: no platform implementation");
+            return result.c_str();
+        }
+        result = platform->MediaType(devicePath);
+        return result.c_str();
+    } catch (...) {
+        SetBurnLastError("Burn_GetMediaType: internal exception");
+        result.clear();
+        return result.c_str();
+    }
+}
+
+int Burn_GetMediaTypeCode(const char* devicePath) {
+    try {
+        if (!devicePath || !devicePath[0]) {
+            SetBurnLastError("Burn_GetMediaTypeCode: devicePath is required");
+            return BURN_MEDIA_UNKNOWN;
+        }
+        IPlatform* platform = GetPlatform();
+        if (!platform) {
+            SetBurnLastError("Burn_GetMediaTypeCode: no platform implementation");
+            return BURN_MEDIA_UNKNOWN;
+        }
+        return platform->MediaTypeCode(devicePath);
+    } catch (...) {
+        SetBurnLastError("Burn_GetMediaTypeCode: internal exception");
+        return BURN_MEDIA_UNKNOWN;
+    }
+}
+
+int Burn_GetMediaState(const char* devicePath) {
+    try {
+        if (!devicePath || !devicePath[0]) {
+            SetBurnLastError("Burn_GetMediaState: devicePath is required");
+            return -1;
+        }
+        IPlatform* platform = GetPlatform();
+        if (!platform) {
+            SetBurnLastError("Burn_GetMediaState: no platform implementation");
+            return -1;
+        }
+        return platform->MediaState(devicePath);
+    } catch (...) {
+        SetBurnLastError("Burn_GetMediaState: internal exception");
+        return -1;
+    }
+}
+
+const char* Burn_GetMediaStateText(const char* devicePath) {
+    static thread_local std::string result;
+    try {
+        result.clear();
+        if (!devicePath || !devicePath[0]) {
+            SetBurnLastError("Burn_GetMediaStateText: devicePath is required");
+            result = "A device path is required";
+            return result.c_str();
+        }
+        IPlatform* platform = GetPlatform();
+        if (!platform) {
+            SetBurnLastError("Burn_GetMediaStateText: no platform implementation");
+            result = "No platform implementation";
+            return result.c_str();
+        }
+        result = platform->MediaStateText(devicePath);
+        return result.c_str();
+    } catch (...) {
+        SetBurnLastError("Burn_GetMediaStateText: internal exception");
+        result = "Media readiness query failed with an internal exception";
+        return result.c_str();
+    }
+}
+
 namespace {
 
 /* Shared plumbing for the synchronous v3 convenience wrappers: build a

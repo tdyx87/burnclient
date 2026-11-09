@@ -225,6 +225,7 @@
       <h2>选择刻录驱动器</h2>
       <p class="lead">下面列出这台电脑上的刻录机。如果列表是空的，说明没有能刻盘的驱动器。</p>
       <select id="device"></select>
+      <div id="mediaBadge" style="margin-top:10px;display:none"></div>
       <div id="devWarn"></div>
       <details id="devDetailsBox" style="margin-top:14px">
         <summary style="cursor:pointer;color:var(--muted);font-size:13px">
@@ -618,6 +619,49 @@
     }
   }
 
+  /* Physical disc and readiness reported by the backend, keyed by path. */
+  var deviceMedia = {};
+  var deviceState = {};
+
+  /* BURN_MEDIA_STATE_* bits (see burning_utility.h). Turn the backend's
+   * English reason into an actionable Chinese hint where we can. */
+  function mediaHint(d) {
+    if (!d || d.ready !== false) { return ""; }
+    var s = d.state || 0;
+    if (s > 0 && (s & 0x4000)) { return ""; }   /* backend cannot tell */
+    if (!(s & 0x0002)) { return "未检测到可写光盘，请放入空白 CD-R/DVD-R 或可擦写盘"; }
+    if (s & 0x0008) { return "光盘被写保护，请解除写保护"; }
+    if (s & 0x0080) { return "光盘已封盘，无法继续写入，请换空白盘"; }
+    if (s & 0x0100) { return "光盘损坏或无法读取，请换一张"; }
+    if (s & 0x0200) { return "需要先擦除这张可擦写光盘"; }
+    if (!(s & 0x0004)) { return "当前介质不受该刻录机支持"; }
+    if (!(s & 0x0070)) { return "光盘不是空白/可追加/可重写状态"; }
+    return d.reason || "驱动器当前不可刻录";
+  }
+
+  function renderMediaBadge() {
+    var box = $("mediaBadge");
+    if (!box) { return; }
+    var dev = $("device").value;
+    if (!dev) { box.style.display = "none"; return; }
+    var type = deviceMedia[dev];
+    var d = deviceState[dev] || {};
+    var hint = mediaHint(d);
+    var pill = document.createElement("span");
+    var canBurn = d.ready !== false || hint === "";
+    pill.className = "pill " + (type && canBurn ? "ok" : "");
+    if (hint) {
+      pill.textContent = hint;
+    } else {
+      pill.textContent = type
+        ? "已插入光盘：" + type + "（可刻录）"
+        : "已插入光盘：无法识别（未插盘或后端不支持）";
+    }
+    box.innerHTML = "";
+    box.appendChild(pill);
+    box.style.display = "block";
+  }
+
   function renderDevices(devices) {
     var sel = $("device");
     var prev = sel.value;
@@ -627,6 +671,9 @@
       none.value = "";
       none.textContent = "没有找到刻录机";
       sel.appendChild(none);
+      deviceMedia = {};
+      deviceState = {};
+      renderMediaBadge();
       $("devWarn").innerHTML =
         '<div class="banner warn">这台电脑没有检测到可用的刻录驱动器。' +
         '你仍然可以在「制作 ISO 镜像」里生成镜像文件。</div>';
@@ -634,29 +681,42 @@
     }
     $("devWarn").innerHTML = "";
     var unusable = 0;
+    var reasons = [];
+    deviceMedia = {};
+    deviceState = {};
     for (var i = 0; i < devices.length; i++) {
       var d = devices[i];
+      deviceMedia[d.path] = d.mediaType || "";
+      deviceState[d.path] = d;
+      var hint = mediaHint(d);
+      var queryUnknown = (d.state > 0) && ((d.state & 0x4000) !== 0);
+      var usable = !!d.writable && (d.ready !== false || queryUnknown);
+      var disc = d.mediaType ? " [" + d.mediaType + "]" : "";
       var opt = document.createElement("option");
       opt.value = d.path;
-      if (d.writable) {
-        opt.textContent = d.path + " — " + friendlyName(d);
+      if (usable) {
+        opt.textContent = d.path + " — " + friendlyName(d) + disc;
       } else {
-        opt.textContent = d.path + " — 当前不可用（" + friendlyName(d) + "）";
+        opt.textContent = d.path + " — 当前不可用（" +
+          (hint || friendlyName(d)) + "）" + disc;
         unusable++;
+        if (hint) { reasons.push(d.path + "：" + hint); }
       }
       sel.appendChild(opt);
     }
     if (prev) { sel.value = prev; }
+    renderMediaBadge();
     if (unusable === devices.length) {
       $("devWarn").innerHTML =
-        '<div class="banner warn">检测到的驱动器都不能用于刻录。' +
-        '常见原因：这是虚拟光驱（只能读取镜像文件，不能刻盘）、' +
-        '驱动器被其他刻录软件占用，或者驱动器本身不支持刻录。' +
-        '请插入一张空白光盘并确认没有其他程序正在使用它。</div>';
+        '<div class="banner warn">检测到的驱动器现在都不能刻录。' +
+        (reasons.length ? "<br>" + reasons.join("<br>") : "") +
+        '<br>请插入一张空白光盘；设备列表每 6 秒自动重新检测。' +
+        '你仍然可以在「制作 ISO 镜像」里生成镜像文件。</div>';
     } else if (unusable > 0) {
       $("devWarn").innerHTML =
-        '<div class="banner warn">有 ' + unusable + ' 个驱动器当前不可用，' +
-        '请在下拉框中选择可用的那一个。</div>';
+        '<div class="banner warn">有 ' + unusable + ' 个驱动器当前不可用' +
+        (reasons.length ? "：" + reasons.join("；") : "") +
+        '。请在下拉框中选择可用的那一个。</div>';
     }
   }
 
@@ -728,7 +788,7 @@
     });
   }
 
-  $("device").onchange = showDriveInfo;
+  $("device").onchange = function () { showDriveInfo(); renderMediaBadge(); };
 
   /* ---------- 任务执行 ---------- */
   function runJob(params, title) {
@@ -943,16 +1003,21 @@
   /* ---------- 各个任务 ---------- */
   $("btnData").onclick = function () {
     var p = common();
-    p.mode = 0;
+    p.mode = 0;   /* default: source is an existing image file */
     p.leaveOpen = $("dataLeaveOpen").checked ? 1 : 0;
 
     /* An explicit path wins: it can also name a folder or an existing ISO,
-     * which a drag-and-drop upload cannot express. */
+     * which a drag-and-drop upload cannot express. The server normalises
+     * a folder into DIRECTORY mode, so a typed folder works too. */
     var typed = $("dataPath").value.trim();
     if (typed) {
       p.source = typed;
     } else if (stagedFiles.length && stagedDir) {
       p.source = stagedDir;
+      /* Dropped files always arrive as a folder of staged copies: build
+       * an ISO from it first. Mode IMAGE would try to open the folder
+       * itself as an image stream and fail with 0x80070005. */
+      p.mode = 1;
     } else {
       log("请先拖入或选择要刻录的文件，或者在「直接填写路径」里填写路径", "warn");
       return;

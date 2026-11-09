@@ -35,6 +35,8 @@ static void* const kRequired[] = {
     (void*)&Burn_VerifyWrite, (void*)&BurnCreateRawImage,
     (void*)&BurnRawImageToDisc, (void*)&BurnEjectTray, (void*)&BurnCloseTray,
     (void*)&Burn_GetDriveInformation,
+    (void*)&Burn_GetMediaType, (void*)&Burn_GetMediaTypeCode,
+    (void*)&Burn_GetMediaState, (void*)&Burn_GetMediaStateText,
 };
 
 static void progressCb(int percent, const char* status, void* userData) {
