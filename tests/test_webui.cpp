@@ -495,7 +495,8 @@ int main(int argc, char** argv) {
     }
 
     /* ---- directory browsing ---- */
-    std::printf("\n=== browse ===\n");    const std::string browse = HttpGet(port, "/api/browse?path=/");
+    std::printf("\n=== browse ===\n");
+    const std::string browse = HttpGet(port, "/api/browse?path=/");
     std::printf("  %s\n", browse.c_str());
     CHECK(!browse.empty());
     CHECK(Contains(browse, "\"entries\":["));
@@ -550,6 +551,94 @@ int main(int argc, char** argv) {
     std::remove("ui_test.iso");
     std::remove((srcDir + "/payload.txt").c_str());
     RMDIR(srcDir.c_str());
+
+    /* ---- the server's parameter mapping ----
+     * The audio pane sends finalize; the engine only understands leaveOpen.
+     * A directory sent for an IMAGE job is normalised to DIRECTORY. The
+     * start response echoes the effective options, so both can be asserted
+     * here instead of trusting that the UI sends the right thing. */
+    std::printf("\n=== parameter mapping ===\n");
+    {
+        MKDIR("map_src");
+        FILE* f = std::fopen("map_src/x.txt", "wb");
+        if (f) { std::fputs("map", f); std::fclose(f); }
+
+        /* finalize=0 (keep the disc appendable) -> leaveOpen=1, and the
+         * other options must pass through unchanged. */
+        const std::string r0 = HttpGet(port, "/api/start?mode=2&source=map_src"
+                                                 "&output=map.iso&finalize=0&verify=1&speed=8");
+        std::printf("  finalize=0 -> %s\n", r0.c_str());
+        CHECK(Contains(r0, "\"ok\":true"));
+        CHECK(Contains(r0, "\"leaveOpen\":1"));
+        CHECK(Contains(r0, "\"verify\":1"));
+        CHECK(Contains(r0, "\"speed\":8"));
+        {
+            const size_t pos = r0.find("\"id\":");
+            CHECK(pos != std::string::npos);
+            if (pos != std::string::npos) {
+                const int id = std::atoi(r0.c_str() + pos + 5);
+                for (int i = 0; i < 80; ++i) {
+                    std::this_thread::sleep_for(std::chrono::milliseconds(250));
+                    const std::string s =
+                        HttpGet(port, std::string("/api/job?id=") + std::to_string(id));
+                    if (Contains(s, "\"state\":2")) break;
+                }
+            }
+        }
+        std::remove("map.iso");
+        std::remove("map_src/x.txt");
+        RMDIR("map_src");
+
+        /* finalize=1 (the default, close the disc) -> leaveOpen=0 */
+        MKDIR("map2_src");
+        f = std::fopen("map2_src/x.txt", "wb");
+        if (f) { std::fputs("map", f); std::fclose(f); }
+        const std::string r1 = HttpGet(port, "/api/start?mode=2&source=map2_src"
+                                                 "&output=map2.iso&finalize=1");
+        std::printf("  finalize=1 -> %s\n", r1.c_str());
+        CHECK(Contains(r1, "\"leaveOpen\":0"));
+        {
+            const size_t pos = r1.find("\"id\":");
+            if (pos != std::string::npos) {
+                const int id = std::atoi(r1.c_str() + pos + 5);
+                for (int i = 0; i < 80; ++i) {
+                    std::this_thread::sleep_for(std::chrono::milliseconds(250));
+                    const std::string s =
+                        HttpGet(port, std::string("/api/job?id=") + std::to_string(id));
+                    if (Contains(s, "\"state\":2")) break;
+                }
+            }
+        }
+        std::remove("map2.iso");
+        std::remove("map2_src/x.txt");
+        RMDIR("map2_src");
+
+        /* A directory sent for an IMAGE job must be normalised to
+         * DIRECTORY. The device is deliberately bogus: the job will fail
+         * there, but the start response must already show the fix. */
+        MKDIR("map3_src");
+        f = std::fopen("map3_src/x.txt", "wb");
+        if (f) { std::fputs("map", f); std::fclose(f); }
+        const std::string r2 = HttpGet(port, "/api/start?mode=0&source=map3_src"
+                                                 "&device=Z:\\nope");
+        std::printf("  IMAGE+dir -> %s\n", r2.c_str());
+        CHECK(Contains(r2, "\"ok\":true"));
+        CHECK(Contains(r2, "\"effective\":{\"mode\":1"));
+        {
+            const size_t pos = r2.find("\"id\":");
+            if (pos != std::string::npos) {
+                const int id = std::atoi(r2.c_str() + pos + 5);
+                for (int i = 0; i < 80; ++i) {
+                    std::this_thread::sleep_for(std::chrono::milliseconds(250));
+                    const std::string s =
+                        HttpGet(port, std::string("/api/job?id=") + std::to_string(id));
+                    if (Contains(s, "\"state\":3")) break;   /* fails at the bogus device */
+                }
+            }
+        }
+        std::remove("map3_src/x.txt");
+        RMDIR("map3_src");
+    }
 
     /* ---- a request that must fail ---- */
     std::printf("\n=== job: invalid request ===\n");

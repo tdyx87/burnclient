@@ -316,6 +316,7 @@
         </div>
 
         <div class="files" id="stagedList"></div>
+        <div class="banner" id="capacityHint" style="display:none;margin-top:10px"></div>
         <input type="hidden" id="dataSource" value="">
 
         <label for="dataPath">或者直接填写路径</label>
@@ -342,6 +343,10 @@
           <option value="DVD+RW">DVD+RW（可擦写 DVD）</option>
         </select>
 
+        <label for="speed">刻录速度</label>
+        <p class="hint">填 <b>0</b> 表示用驱动器默认速度。盘片质量差时可手动调低。</p>
+        <input id="speed" type="number" min="0" max="108" value="0" style="margin-top:4px">
+
         <label for="verify">刻完后检查</label>
         <p class="hint">检查会让刻录多花一点时间，但能确认光盘没刻坏。</p>
         <select id="verify">
@@ -363,7 +368,22 @@
           要求 <b>44.1 kHz、16 位、立体声</b> 的 WAV 文件，每首 <b>至少 4 秒</b>。<br>
           格式不对会在开始刻录前就提示你，不会浪费光盘。
         </p>
-        <textarea id="audioTracks" placeholder="D:\音乐\第一首.wav&#10;D:\音乐\第二首.wav"></textarea>
+
+        <div class="dropzone" id="audioDropZone">
+          <span class="ico">🎵</span>
+          <div>
+            <div class="ttl">把 WAV 文件拖到这里</div>
+            <div class="dsc">拖入后会自动上传并填到下面的路径列表</div>
+          </div>
+        </div>
+        <div class="row" style="margin-top:10px">
+          <div style="flex:1">
+            <button class="btn" id="btnPickAudio" style="width:100%">选择 WAV 文件</button>
+            <input type="file" id="audioPicker" multiple accept=".wav,audio/wav,audio/x-wav" style="display:none">
+          </div>
+        </div>
+
+        <textarea id="audioTracks" rows="5" placeholder="每行一个 WAV 路径&#10;D:\音乐\第一首.wav&#10;D:\音乐\第二首.wav"></textarea>
 
         <label for="audioFinalize">写完目录表并封盘</label>
         <p class="hint">保持勾选即可。取消勾选的话，之后还能往这张 CD 里追加数据。</p>
@@ -628,6 +648,12 @@
   function mediaHint(d) {
     if (!d || d.ready !== false) { return ""; }
     var s = d.state || 0;
+    if (s < 0) {
+      /* -1 means the backend could not resolve the recorder at all (a
+       * virtual drive, a busy one). Show the reason, not a bit guess:
+       * -1 has every bit set, so the checks below would lie. */
+      return d.reason || "驱动器当前不可刻录";
+    }
     if (s > 0 && (s & 0x4000)) { return ""; }   /* backend cannot tell */
     if (!(s & 0x0002)) { return "未检测到可写光盘，请放入空白 CD-R/DVD-R 或可擦写盘"; }
     if (s & 0x0008) { return "光盘被写保护，请解除写保护"; }
@@ -843,7 +869,7 @@
     return {
       device: $("device").value,
       discType: $("discType").value,
-      speed: 0,
+      speed: parseInt($("speed").value, 10) || 0,
       verify: $("verify").value
     };
   }
@@ -867,12 +893,20 @@
     return (bytes / 1073741824).toFixed(2) + " GB";
   }
 
+  /* 常见光盘容量参考（字节），用于容量提示。 */
+  var discCapacity = {
+    "CD-R": 700 * 1048576, "CD-RW": 700 * 1048576,
+    "DVD-R": 4.7 * 1073741824, "DVD-RW": 4.7 * 1073741824,
+    "DVD+R": 4.7 * 1073741824, "DVD+RW": 4.7 * 1073741824
+  };
+
   function renderFileList() {
     var box = $("stagedList");
     box.innerHTML = "";
     if (!stagedFiles.length) {
       box.innerHTML = '<div style="padding:10px;color:var(--muted);cursor:default">' +
                       "还没有选择文件。</div>";
+      updateCapacityHint();
       return;
     }
     stagedFiles.forEach(function (item, index) {
@@ -896,7 +930,27 @@
       row.appendChild(kill);
       box.appendChild(row);
     });
+    updateCapacityHint();
   }
+
+  /* 计算已选文件总大小并对比当前光盘类型容量。 */
+  function updateCapacityHint() {
+    var hint = $("capacityHint");
+    if (!hint) { return; }
+    if (!stagedFiles.length) { hint.style.display = "none"; return; }
+    var total = 0;
+    stagedFiles.forEach(function (item) { total += item.size; });
+    var cap = discCapacity[$("discType").value];
+    var capStr = cap ? fmtSize(cap) : "未知";
+    hint.style.display = "block";
+    hint.className = "banner " + (cap && total > cap ? "err" : "ok");
+    hint.innerHTML = "已选文件约 <b>" + fmtSize(total) + "</b>，" +
+                     $("discType").value + " 容量约 <b>" + capStr + "</b>。" +
+                     (cap && total > cap ? "<br>⚠ 超出容量，请减少文件或更换更大容量的光盘。"
+                                          : "<br>✓ 容量充足。");
+  }
+
+  $("discType").onchange = updateCapacityHint;
 
   /* Upload one file at a time: simple, and it keeps the server free of a
    * multipart parser. */
@@ -976,6 +1030,77 @@
     });
     zone.onclick = function () { $("filePicker").click(); };
   })();
+
+  /* 音频拖拽：上传 WAV 后把暂存路径追加到文本框。 */
+  function uploadAudioFiles(fileList) {
+    var list = [];
+    for (var i = 0; i < fileList.length; i++) {
+      if (/\.wav$/i.test(fileList[i].name)) { list.push(fileList[i]); }
+    }
+    if (!list.length) {
+      log("请选择 WAV 文件（.wav）", "warn");
+      return Promise.resolve();
+    }
+    if (!uploadSid) { uploadSid = newSessionId(); }
+
+    log("正在上传 " + list.length + " 个音频文件…", "muted");
+    var chain = Promise.resolve();
+    var count = 0;
+    list.forEach(function (file) {
+      chain = chain.then(function () {
+        return uploadOne(file).then(function (res) {
+          if (res && res.ok) {
+            count++;
+            var box = $("audioTracks");
+            var cur = box.value ? "\n" : "";
+            box.value = box.value + cur + res.path;
+            log("✔ 已添加音轨：" + res.name + " (" + fmtSize(res.size) + ")", "ok");
+          } else {
+            log("✗ 上传失败：" + file.name, "err");
+          }
+        });
+      });
+    });
+    return chain.then(function () {
+      log("共添加 " + count + " 首音轨", "ok");
+    });
+  }
+
+  (function () {
+    var zone = $("audioDropZone");
+    if (!zone) { return; }
+    ["dragenter", "dragover"].forEach(function (name) {
+      zone.addEventListener(name, function (e) {
+        e.preventDefault();
+        e.stopPropagation();
+        zone.style.borderColor = "var(--accent)";
+        zone.style.background = "rgba(91,140,255,.16)";
+      });
+    });
+    ["dragleave", "drop"].forEach(function (name) {
+      zone.addEventListener(name, function (e) {
+        e.preventDefault();
+        e.stopPropagation();
+        zone.style.borderColor = "";
+        zone.style.background = "";
+      });
+    });
+    zone.addEventListener("drop", function (e) {
+      var dt = e.dataTransfer;
+      if (dt && dt.files && dt.files.length) { uploadAudioFiles(dt.files); }
+    });
+    zone.onclick = function () { $("audioPicker").click(); };
+  })();
+
+  $("btnPickAudio").onclick = function (e) {
+    e.preventDefault();
+    $("audioPicker").click();
+  };
+
+  $("audioPicker").onchange = function () {
+    if (this.files && this.files.length) { uploadAudioFiles(this.files); }
+    this.value = "";
+  };
 
   $("btnPickFiles").onclick = function (e) {
     e.preventDefault();

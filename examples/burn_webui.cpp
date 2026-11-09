@@ -123,6 +123,8 @@ struct Request {
     std::string path;
     std::map<std::string, std::string> fields;
     std::string body;
+    std::string host;        /* raw Host header */
+    std::string origin;      /* raw Origin header, when the client sent one */
 };
 
 std::map<std::string, std::string> ParseQuery(const std::string& query) {
@@ -242,16 +244,27 @@ struct UiJob {
     std::atomic<bool> finished{false};
     std::string label;
     bool reported = false;   /* the client has already seen the final state */
+    /* Staging directory the burn consumed, if the source came from an
+     * upload. Removed when the job is released. */
+    std::string stageDir;
 };
+
+/* Forward declaration: defined with the upload staging helpers below,
+ * but HandleStart needs it to recognise a staged source and HandleJobStatus
+ * needs it to clean the staging directory up. */
+static std::string StagingRoot();
+static void RemoveTree(const std::string& path);
 
 std::map<int, UiJob*> g_jobs;
 std::mutex g_jobsMutex;
 int g_nextJobId = 1;
 
-int RegisterJob(BurnJobHandle handle, const std::string& label) {
+int RegisterJob(BurnJobHandle handle, const std::string& label,
+                const std::string& stageDir) {
     UiJob* job = new UiJob();
     job->handle = handle;
     job->label = label;
+    job->stageDir = stageDir;
     std::lock_guard<std::mutex> lock(g_jobsMutex);
     const int id = g_nextJobId++;
     g_jobs[id] = job;
@@ -380,9 +393,17 @@ JobRequest ParseJobRequest(const Request& r) {
     j.verifyLevel = IntField(r, "verify", 0);
     j.fileSystems = IntField(r, "fileSystems", 0);
     j.interchangeLevel = IntField(r, "isoLevel", 0);
-    j.leaveOpen = IntField(r, "leaveOpen", 0);
     j.eraseFull = IntField(r, "eraseFull", 0);
     j.startingTrackNumber = IntField(r, "startTrack", 0);
+    /* finalize is the audio pane's spelling of leaveOpen: finalize=1
+     * (default) closes the disc, finalize=0 keeps it appendable.
+     * The engine expresses both as leaveOpen. */
+    const std::string fin = Field(r, "finalize");
+    if (!fin.empty()) {
+        j.leaveOpen = (std::atoi(fin.c_str()) == 0) ? 1 : 0;
+    } else {
+        j.leaveOpen = IntField(r, "leaveOpen", 0);
+    }
     const std::string tracks = Field(r, "tracks");
     size_t pos = 0;
     while (pos <= tracks.size() && !tracks.empty()) {
@@ -473,8 +494,26 @@ std::string HandleStart(const Request& r) {
         return "{\"ok\":false,\"error\":" + JsonString(GetLastErrorMessage()) + "}";
     }
 
-    const int id = RegisterJob(handle, j.mode == BURN_JOB_MODE_ERASE ? "erase" : "burn");
-    std::string out = "{\"ok\":true,\"id\":" + std::to_string(id) + "}";
+    /* If the source came from an upload, the staging directory is now the
+     * thing being burned. Record it so the directory is removed when the
+     * job is released instead of accumulating in the temp area. */
+    std::string stageDir;
+    const std::string stagingRoot = StagingRoot();
+    if (!j.sourcePath.empty() &&
+        j.sourcePath.compare(0, stagingRoot.size(), stagingRoot) == 0) {
+        stageDir = j.sourcePath;
+    }
+
+    const int id = RegisterJob(handle, j.mode == BURN_JOB_MODE_ERASE ? "erase" : "burn",
+                               stageDir);
+    /* Echo the effective options so a client (or the test suite) can see
+     * what was actually requested: the audio pane's finalize was folded
+     * into leaveOpen, and IMAGE+directory was normalised to DIRECTORY. */
+    std::string out = "{\"ok\":true,\"id\":" + std::to_string(id) +
+                      ",\"effective\":{\"mode\":" + std::to_string(o.mode) +
+                      ",\"leaveOpen\":" + std::to_string(o.leaveOpen) +
+                      ",\"verify\":" + std::to_string(o.verifyLevel) +
+                      ",\"speed\":" + std::to_string(o.speed) + "}}";
     return out;
 }
 
@@ -511,6 +550,11 @@ std::string HandleJobStatus(const Request& r) {
             if (it->second->reported) {
                 /* The client already saw the final state: release now. */
                 Burn_Release(handle);
+                /* The upload staging directory has served its purpose:
+                 * remove it so the temp area does not grow forever. */
+                if (!it->second->stageDir.empty()) {
+                    RemoveTree(it->second->stageDir);
+                }
                 delete it->second;
                 g_jobs.erase(it);
             } else {
@@ -847,6 +891,47 @@ void SendResponse(SOCKET_TYPE sock, int code, const std::string& contentType,
 std::atomic<int> g_requestLimit{0};
 std::atomic<int> g_servedRequests{0};
 
+/* A hard cap on one uploaded file. A full CD/DVD image is at most a few
+ * gigabytes, and everything past this is an accident or an attack. */
+static const size_t kMaxUploadBytes = 8ull * 1024 * 1024 * 1024;   /* 8 GiB */
+
+/* Endpoints that change the machine (erase media, start a burn, move the
+ * tray). A request to them from a foreign page is refused unless it is
+ * obviously a local fetch. */
+static bool IsMutatingPath(const std::string& path) {
+    return path == "/api/start" || path == "/api/cancel" || path == "/api/tray" ||
+           path == "/api/upload" || path == "/api/stage/clear";
+}
+
+/* The request must come from the loopback interface: check the Host header
+ * so a rebinding attack cannot point a remote page at this address. */
+static bool IsLocalHostHeader(const std::string& host) {
+    /* Accept "127.0.0.1", "[::1]", "localhost", with or without :port. */
+    if (host.empty()) return false;
+    const size_t bracketEnd = (host[0] == '[') ? host.find("]") : std::string::npos;
+    if (bracketEnd != std::string::npos) {
+        const std::string lit = host.substr(0, bracketEnd + 1);
+        return lit == "[::1]";
+    }
+    std::string h = host;
+    const size_t colon = h.find(':');
+    if (colon != std::string::npos) h = h.substr(0, colon);
+    return h == "127.0.0.1" || h == "[::1]" || h == "localhost";
+}
+
+/* Ask the browser for the request's origin. "null" (sandboxed iframe, some
+ * extensions) is not the local page and is refused. */
+static bool IsLocalOrigin(const std::string& origin) {
+    if (origin.empty()) return false;
+    if (origin == "null") return false;
+    const size_t scheme = origin.find("://");
+    if (scheme == std::string::npos) return false;
+    const std::string rest = origin.substr(scheme + 3);
+    const size_t slash = rest.find('/');
+    const std::string authority = slash == std::string::npos ? rest : rest.substr(0, slash);
+    return IsLocalHostHeader(authority);
+}
+
 /* Case-insensitive header lookup on the raw request head. */
 static bool FindHeader(const std::string& head, const char* name, std::string& out) {
     const size_t nameLen = std::strlen(name);
@@ -910,12 +995,42 @@ void HandleConnection(SOCKET_TYPE sock) {
         req.path = req.path.substr(0, q);
     }
 
+    /* Extract the Host and Origin headers for the loopback check. */
+    {
+        const std::string head = raw.substr(0, headerEnd);
+        if (FindHeader(head, "host", req.host)) {
+            /* A Host header is mandatory for HTTP/1.1; anything that is not
+             * the local machine is refused. */
+            if (!IsLocalHostHeader(req.host)) {
+                SendResponse(sock, 403, "application/json; charset=utf-8",
+                             "{\"error\":\"this console is bound to loopback only\"}");
+                CLOSE_SOCKET(sock);
+                return;
+            }
+        }
+        if (FindHeader(head, "origin", req.origin) && !IsLocalOrigin(req.origin)) {
+            if (IsMutatingPath(req.path)) {
+                SendResponse(sock, 403, "application/json; charset=utf-8",
+                             "{\"error\":\"cross-origin write refused\"}");
+                CLOSE_SOCKET(sock);
+                return;
+            }
+        }
+    }
+
     /* Finish reading the body if the client announced its length. */
     {
         std::string lengthHeader;
         size_t wanted = 0;
         if (FindHeader(raw.substr(0, headerEnd), "content-length", lengthHeader)) {
             wanted = (size_t)std::strtoull(lengthHeader.c_str(), nullptr, 10);
+        }
+        if (req.path == "/api/upload" && wanted > kMaxUploadBytes) {
+            SendResponse(sock, 413, "application/json; charset=utf-8",
+                         "{\"error\":\"upload exceeds " +
+                         std::to_string(kMaxUploadBytes) + " bytes\"}");
+            CLOSE_SOCKET(sock);
+            return;
         }
         std::string bodyBytes = raw.substr(headerEnd + 4);
         while (bodyBytes.size() < wanted) {
