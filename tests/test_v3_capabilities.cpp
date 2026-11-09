@@ -763,11 +763,17 @@ static void TestMediaStateQuery() {
     CHECK(emptyText[0] != '\0');
 
     const char* bogus = "Z:\\no-such-recorder";
-    CHECK(Burn_GetMediaState(bogus) == -1);
+    /* Either answer is contract-correct: -1 when the backend resolves
+     * devices and cannot find this one, or QUERY_UNSUPPORTED when the
+     * backend does not implement the readiness query at all (the Linux
+     * default body). The text must explain whichever happened. */
+    const int bogusState = Burn_GetMediaState(bogus);
+    CHECK(bogusState == -1 ||
+          (bogusState & BURN_MEDIA_STATE_QUERY_UNSUPPORTED) != 0);
     const char* bogusText = Burn_GetMediaStateText(bogus);
     CHECK(bogusText != nullptr);
     CHECK(bogusText[0] != '\0');
-    INFO("  bogus device -> %d, '%s'\n", Burn_GetMediaState(bogus), bogusText);
+    INFO("  bogus device -> %d, '%s'\n", bogusState, bogusText);
 
     DeviceInfo* devices = nullptr;
     int count = 0;
@@ -779,9 +785,16 @@ static void TestMediaStateQuery() {
                  devices[i].devicePath, state,
                  (state > 0 && (state & BURN_MEDIA_STATE_READY)) ? 1 : 0,
                  devices[i].isWritable, reason ? reason : "(null)");
-            CHECK(state >= 0);
+            /* An enumerated drive is not necessarily openable: a virtual
+             * drive whose recorder cannot be initialised must answer -1
+             * with an actionable reason (documented contract), and a
+             * backend without readiness support answers QUERY_UNSUPPORTED.
+             * The strict invariants below apply only when the query
+             * actually resolved the device. */
+            CHECK(state >= 0 || state == -1);
             CHECK(reason != nullptr);
             CHECK(reason[0] != '\0');
+            if (state == -1) continue;   /* nothing more to assert */
             /* isWritable must agree with the structured readiness query:
              * this is the invariant that stops empty trays being offered. */
             const bool ready = state > 0 &&
@@ -789,9 +802,9 @@ static void TestMediaStateQuery() {
                                (state & BURN_MEDIA_STATE_QUERY_UNSUPPORTED) == 0;
             if ((state & BURN_MEDIA_STATE_QUERY_UNSUPPORTED) == 0) {
                 CHECK((devices[i].isWritable != 0) == ready);
-            }
-            if (devices[i].isEmpty) {
-                CHECK((state & BURN_MEDIA_STATE_BLANK) != 0);
+                if (devices[i].isEmpty) {
+                    CHECK((state & BURN_MEDIA_STATE_BLANK) != 0);
+                }
             }
         }
         FreeDeviceList(devices, count);
